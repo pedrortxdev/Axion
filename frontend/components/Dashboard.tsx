@@ -1,0 +1,562 @@
+'use client';
+
+import React, { useEffect, useState, useRef } from 'react';
+import { AreaChart, Area, ResponsiveContainer, Tooltip } from 'recharts';
+import { Server, Cpu, Zap, Activity, Play, Square, RefreshCw, Loader2, Settings, Save, History, Wifi, WifiOff, Plus, SquareTerminal, Trash2, AlertTriangle, HardDrive, Network, FolderOpen, MoreVertical, X } from 'lucide-react';
+import { toast, Toaster } from 'sonner';
+import { useRouter } from 'next/navigation';
+import ActivityDrawer from './ActivityDrawer';
+import CreateInstanceModal from './CreateInstanceModal';
+import SnapshotDrawer from './SnapshotDrawer';
+import NetworkDrawer from './NetworkDrawer';
+import FileExplorerDrawer from './FileExplorerDrawer';
+import WebTerminal from './WebTerminal';
+import { Job, InstanceMetric } from '@/types';
+
+// --- Types Local ---
+
+interface InstanceHistory {
+  name: string;
+  data: { time: string; memoryMB: number }[];
+}
+
+interface ResourceState {
+  memoryInput: number;
+  cpuInput: number;
+  isDirty: boolean;
+}
+
+// --- Helper Functions ---
+
+const formatBytes = (bytes: number) => {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+};
+
+const formatMemToMB = (bytes: number) => {
+  return parseFloat((bytes / (1024 * 1024)).toFixed(1));
+};
+
+const parseMemoryString = (memStr?: string): number => {
+  if (!memStr) return 128; 
+  const match = memStr.match(/^(\d+)(MB|GB)?$/i);
+  if (!match) return 128;
+  const value = parseInt(match[1], 10);
+  const unit = match[2]?.toUpperCase();
+  if (unit === 'GB') return value * 1024;
+  return value;
+};
+
+const parseCpuString = (cpuStr?: string): number => {
+  if (!cpuStr) return 1;
+  return parseInt(cpuStr, 10) || 1;
+};
+
+// --- Component ---
+
+export default function Dashboard() {
+  // State
+  const [metrics, setMetrics] = useState<InstanceMetric[]>([]);
+  const [history, setHistory] = useState<Record<string, InstanceHistory>>({});
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [connected, setConnected] = useState(false);
+  const [lastUpdate, setLastUpdate] = useState<string>('-');
+  const [token, setToken] = useState<string | null>(null);
+  
+  // UI State
+  const [isActivityOpen, setIsActivityOpen] = useState(false);
+  const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
+  const [snapshotInstance, setSnapshotInstance] = useState<string | null>(null);
+  const [networkInstance, setNetworkInstance] = useState<string | null>(null);
+  const [fileInstance, setFileInstance] = useState<string | null>(null);
+  const [terminalInstance, setTerminalInstance] = useState<string | null>(null);
+  const [showSettings, setShowSettings] = useState<Record<string, boolean>>({});
+  const [resourceInputs, setResourceInputs] = useState<Record<string, ResourceState>>({});
+  
+  // Menu State
+  const [menuOpen, setMenuOpen] = useState<string | null>(null);
+  
+  // Refs
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const draggingRef = useRef<Record<string, boolean>>({});
+  
+  const router = useRouter();
+
+  // --- Auth Check ---
+  useEffect(() => {
+    const storedToken = localStorage.getItem('axion_token');
+    if (!storedToken) {
+        router.push('/login');
+    } else {
+        setToken(storedToken);
+    }
+  }, [router]);
+
+  // --- Initial Data Fetch ---
+  useEffect(() => {
+    if (!token) return;
+
+    const fetchJobs = async () => {
+      try {
+        const protocol = window.location.protocol;
+        const host = window.location.hostname;
+        const port = '8500';
+        const res = await fetch(`${protocol}//${host}:${port}/jobs`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+        });
+        
+        if (res.status === 401) {
+            localStorage.removeItem('axion_token');
+            router.push('/login');
+            return;
+        }
+
+        if (res.ok) {
+          const data = await res.json();
+          setJobs(data || []);
+        }
+      } catch (err) {
+        console.error("Failed to fetch jobs:", err);
+      }
+    };
+    fetchJobs();
+  }, [token, router]);
+
+  // --- WebSocket Logic ---
+  const connect = () => {
+    if (!token) return;
+    if (wsRef.current?.readyState === WebSocket.OPEN || wsRef.current?.readyState === WebSocket.CONNECTING) return;
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = window.location.hostname;
+    const wsUrl = `${protocol}//${host}:8500/ws/telemetry?token=${token}`;
+
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setConnected(true);
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const rawData = JSON.parse(event.data);
+        if (Array.isArray(rawData)) {
+            handleTelemetry(rawData);
+            return;
+        }
+        if (rawData.type === 'job_update') {
+            handleJobUpdate(rawData.payload as Job);
+        }
+      } catch (err) {
+        console.error('WS parsing error:', err);
+      }
+    };
+
+    ws.onclose = () => {
+      setConnected(false);
+      wsRef.current = null;
+      scheduleReconnect();
+    };
+
+    ws.onerror = () => ws.close();
+  };
+
+  const scheduleReconnect = () => {
+    if (!reconnectTimeoutRef.current) {
+      reconnectTimeoutRef.current = setTimeout(() => {
+        reconnectTimeoutRef.current = null;
+        connect();
+      }, 2000);
+    }
+  };
+
+  useEffect(() => {
+    if (token) connect();
+    return () => {
+      if (wsRef.current) wsRef.current.close();
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+    };
+  }, [token]); 
+
+  // --- Message Handlers ---
+
+  const handleTelemetry = (data: InstanceMetric[]) => {
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    setLastUpdate(timeStr);
+    setMetrics(data);
+
+    setResourceInputs(prev => {
+        const next = { ...prev };
+        let changed = false;
+        data.forEach(inst => {
+            const isDragging = draggingRef.current[inst.name];
+            const currentLocal = next[inst.name];
+            if (!isDragging && (!currentLocal || !currentLocal.isDirty)) {
+                const serverMem = parseMemoryString(inst.config["limits.memory"]);
+                const serverCpu = parseCpuString(inst.config["limits.cpu"]);
+                if (!currentLocal || currentLocal.memoryInput !== serverMem || currentLocal.cpuInput !== serverCpu) {
+                    next[inst.name] = { memoryInput: serverMem, cpuInput: serverCpu, isDirty: false };
+                    changed = true;
+                }
+            }
+        });
+        return changed ? next : prev;
+    });
+
+    setHistory(prevHistory => {
+      const newHistory = { ...prevHistory };
+      data.forEach(instance => {
+        if (!newHistory[instance.name]) newHistory[instance.name] = { name: instance.name, data: [] };
+        const currentData = [...newHistory[instance.name].data];
+        currentData.push({ time: timeStr, memoryMB: formatMemToMB(instance.memory_usage_bytes) });
+        if (currentData.length > 60) currentData.shift();
+        newHistory[instance.name] = { ...newHistory[instance.name], data: currentData };
+      });
+      return newHistory;
+    });
+  };
+
+  const handleJobUpdate = (job: Job) => {
+    setJobs(prevJobs => {
+        const index = prevJobs.findIndex(j => j.id === job.id);
+        if (index !== -1) {
+            const updated = [...prevJobs];
+            updated[index] = job;
+            return updated;
+        }
+        return [job, ...prevJobs];
+    });
+
+    if (job.status === 'COMPLETED') {
+        toast.success(
+            <div className="flex flex-col gap-1">
+                <span className="font-semibold">Operation Completed</span>
+                <span className="text-xs text-zinc-400">{job.type} on {job.target} finished successfully.</span>
+            </div>
+        );
+    } else if (job.status === 'FAILED') {
+        toast.error(
+            <div className="flex flex-col gap-1">
+                <span className="font-semibold">Operation Failed</span>
+                <span className="text-xs text-zinc-400">{job.error}</span>
+            </div>
+        );
+    }
+  };
+
+  // --- Actions ---
+
+  const handlePowerAction = async (name: string, action: 'start' | 'stop' | 'restart') => {
+    if (!token) return;
+    try {
+      const protocol = window.location.protocol;
+      const host = window.location.hostname;
+      const port = '8500';
+      const response = await fetch(`${protocol}//${host}:${port}/instances/${name}/state`, {
+        method: 'POST',
+        headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ action }),
+      });
+
+      if (response.status === 401) {
+          router.push('/login');
+          return;
+      }
+
+      if (response.ok) {
+        toast.info("Request Queued");
+      } else {
+        const error = await response.json();
+        toast.error("Request Rejected", { description: error.error });
+      }
+    } catch (error) {
+        toast.error("Network Error");
+    }
+  };
+
+  const handleApplyLimits = async (name: string) => {
+    const inputs = resourceInputs[name];
+    if (!inputs || !token) return;
+
+    try {
+      const protocol = window.location.protocol;
+      const host = window.location.hostname;
+      const port = '8500';
+      const payload = { memory: `${inputs.memoryInput}MB`, cpu: `${inputs.cpuInput}` };
+      
+      const response = await fetch(`${protocol}//${host}:${port}/instances/${name}/limits`, {
+        method: 'POST',
+        headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (response.status === 401) {
+          router.push('/login');
+          return;
+      }
+
+      if (response.ok) {
+        toast.info("Config Update Queued");
+        setResourceInputs(prev => ({ ...prev, [name]: { ...prev[name], isDirty: false } }));
+        setShowSettings(prev => ({ ...prev, [name]: false })); // Close settings on success
+      } else {
+        const error = await response.json();
+        toast.error("Update Rejected", { description: error.error });
+      }
+    } catch (error) {
+        toast.error("Network Error");
+    }
+  };
+
+  const handleDeleteInstance = async (name: string) => {
+    if (!token) return;
+    if (!window.confirm(`Are you sure you want to DELETE instance "${name}"?`)) return;
+
+    try {
+      const protocol = window.location.protocol;
+      const host = window.location.hostname;
+      const port = '8500';
+      const response = await fetch(`${protocol}//${host}:${port}/instances/${name}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+
+      if (response.ok) {
+        toast.info("Deletion Queued");
+        setShowSettings(prev => ({ ...prev, [name]: false }));
+      } else {
+        toast.error("Deletion Rejected");
+      }
+    } catch (error) {
+        toast.error("Network Error");
+    }
+  };
+
+  const handleSliderChange = (name: string, type: 'memory' | 'cpu', value: number) => {
+    setResourceInputs(prev => ({
+        ...prev,
+        [name]: { ...prev[name], [type === 'memory' ? 'memoryInput' : 'cpuInput']: value, isDirty: true }
+    }));
+  };
+
+  const isInstanceBusy = (name: string) => {
+    return jobs?.some(j => j.target === name && j.status === 'IN_PROGRESS');
+  };
+
+  // Close menu when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+        if (menuOpen && !(event.target as Element).closest('.menu-trigger')) {
+            setMenuOpen(null);
+        }
+    };
+    document.addEventListener('click', handleClickOutside);
+    return () => document.removeEventListener('click', handleClickOutside);
+  }, [menuOpen]);
+
+  // --- Render ---
+
+  if (!token) return null; 
+
+  return (
+    <div className="min-h-screen bg-zinc-950 text-zinc-200 font-sans antialiased selection:bg-indigo-500/30">
+      <Toaster position="top-right" theme="dark" closeButton />
+      
+      <ActivityDrawer isOpen={isActivityOpen} onClose={() => setIsActivityOpen(false)} jobs={jobs || []} />
+      <CreateInstanceModal isOpen={isCreateModalOpen} onClose={() => setIsCreateModalOpen(false)} token={token} />
+      <SnapshotDrawer isOpen={!!snapshotInstance} onClose={() => setSnapshotInstance(null)} instanceName={snapshotInstance} />
+      <NetworkDrawer isOpen={!!networkInstance} onClose={() => setNetworkInstance(null)} instance={metrics.find(m => m.name === networkInstance) || null} />
+      <FileExplorerDrawer isOpen={!!fileInstance} onClose={() => setFileInstance(null)} instanceName={fileInstance} />
+      {terminalInstance && <WebTerminal instanceName={terminalInstance} onClose={() => setTerminalInstance(null)} />}
+
+      <div className="max-w-7xl mx-auto p-6 md:p-12">
+        {/* Header */}
+        <header className="flex flex-col md:flex-row md:items-center justify-between mb-12 border-b border-zinc-900 pb-6">
+          <div className="flex items-center gap-3">
+            <div className="h-8 w-8 bg-zinc-100 rounded-lg flex items-center justify-center text-zinc-950 font-bold shadow-lg shadow-zinc-100/10">A</div>
+            <div>
+              <h1 className="text-xl font-semibold tracking-tight text-zinc-100 flex items-center gap-2">
+                Axion Control Plane
+                <span className="px-2 py-0.5 rounded-full bg-zinc-900 border border-zinc-800 text-[10px] font-medium text-zinc-400 uppercase tracking-wider">v1.0</span>
+              </h1>
+              <p className="text-sm text-zinc-500">Event-driven orchestration</p>
+            </div>
+          </div>
+          
+          <div className="flex items-center gap-4 mt-4 md:mt-0">
+             <button onClick={() => setIsCreateModalOpen(true)} className="flex items-center gap-2 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-md text-sm font-medium shadow-lg shadow-indigo-900/20 transition-all hover:scale-[1.02]">
+                <Plus size={16} /><span>New Instance</span>
+             </button>
+             <button onClick={() => setIsActivityOpen(true)} className="group flex items-center gap-2 px-3 py-1.5 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 rounded-md text-sm text-zinc-400 hover:text-zinc-200 transition-all hover:border-zinc-700">
+                <History size={16} className="group-hover:text-indigo-400 transition-colors" /><span>Activity</span>
+                {jobs?.some(j => j.status === 'IN_PROGRESS') && (
+                    <span className="flex h-2 w-2 relative ml-1"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span><span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span></span>
+                )}
+             </button>
+             <div className="h-6 w-px bg-zinc-900 mx-2"></div>
+             <div className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-zinc-900/50 border border-zinc-800/50">
+                {connected ? <Wifi size={14} className="text-emerald-500" /> : <WifiOff size={14} className="text-red-500" />}
+                <span className="text-xs text-zinc-500 font-mono">{lastUpdate}</span>
+             </div>
+          </div>
+        </header>
+
+        {/* Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {metrics.map((inst) => {
+            const isRunning = inst.status.toLowerCase() === 'running';
+            const histData = history[inst.name]?.data || [];
+            const isBusy = isInstanceBusy(inst.name);
+            const isSettingsOpen = showSettings[inst.name];
+            const isMenuOpen = menuOpen === inst.name;
+            const inputs = resourceInputs[inst.name] || { memoryInput: 128, cpuInput: 1, isDirty: false };
+
+            return (
+              <div key={inst.name} className={`group bg-zinc-900/30 backdrop-blur-sm border border-zinc-800 rounded-xl p-5 transition-all duration-300 flex flex-col relative overflow-visible ${isSettingsOpen ? 'ring-1 ring-zinc-700 shadow-xl shadow-black/50' : 'hover:border-zinc-700 hover:shadow-lg hover:shadow-black/20'}`}>
+                {/* Status Stripe */}
+                <div className={`absolute top-0 left-0 w-full h-0.5 rounded-t-xl ${isRunning ? 'bg-emerald-500/50' : 'bg-zinc-800'}`}></div>
+
+                {/* Header */}
+                <div className="flex justify-between items-start mb-6">
+                  <div className="flex items-center gap-3">
+                    <div className={`p-2.5 rounded-lg border ${isRunning ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-500' : 'bg-zinc-800/50 border-zinc-700/50 text-zinc-500'}`}>
+                      <Server size={18} strokeWidth={1.5} />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-semibold text-zinc-200 tracking-tight">{inst.name}</h3>
+                      <div className="flex items-center gap-1.5 mt-0.5">
+                        <span className={`h-1.5 w-1.5 rounded-full ${isRunning ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'bg-zinc-600'}`}></span>
+                        <span className="text-[10px] font-medium text-zinc-500 uppercase tracking-wider">{inst.status}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Controls */}
+                  <div className="flex items-center gap-1 relative">
+                    {isBusy ? (
+                      <div className="px-2 py-1 bg-indigo-500/10 border border-indigo-500/20 rounded text-xs text-indigo-400 flex items-center gap-2">
+                        <Loader2 size={12} className="animate-spin" />
+                        <span>Working...</span>
+                      </div>
+                    ) : (
+                      <>
+                        {isRunning && (
+                            <button onClick={() => setTerminalInstance(inst.name)} className="p-2 text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/50 rounded-md transition-colors" title="Terminal">
+                                <SquareTerminal size={16} />
+                            </button>
+                        )}
+
+                        {isRunning ? (
+                          <>
+                            <button onClick={() => handlePowerAction(inst.name, 'restart')} className="p-2 text-zinc-500 hover:text-blue-400 hover:bg-blue-500/10 rounded-md transition-colors"><RefreshCw size={16} /></button>
+                            <button onClick={() => handlePowerAction(inst.name, 'stop')} className="p-2 text-zinc-500 hover:text-red-400 hover:bg-red-500/10 rounded-md transition-colors"><Square size={16} fill="currentColor" className="opacity-80" /></button>
+                          </>
+                        ) : (
+                          <button onClick={() => handlePowerAction(inst.name, 'start')} className="p-2 text-zinc-500 hover:text-emerald-400 hover:bg-emerald-500/10 rounded-md transition-colors"><Play size={16} fill="currentColor" className="opacity-80" /></button>
+                        )}
+
+                        {/* Menu Trigger */}
+                        <button 
+                            className={`p-2 rounded-md transition-colors menu-trigger ${isMenuOpen ? 'bg-zinc-800 text-zinc-200' : 'text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/50'}`}
+                            onClick={(e) => { e.stopPropagation(); setMenuOpen(isMenuOpen ? null : inst.name); }}
+                        >
+                            <MoreVertical size={16} />
+                        </button>
+
+                        {/* Dropdown Menu */}
+                        {isMenuOpen && (
+                            <div className="absolute top-full right-0 mt-2 w-48 bg-zinc-900 border border-zinc-800 rounded-lg shadow-xl z-20 py-1 animate-in fade-in zoom-in-95 duration-100 origin-top-right">
+                                <button onClick={() => { setFileInstance(inst.name); setMenuOpen(null); }} className="w-full text-left px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 flex items-center gap-2">
+                                    <FolderOpen size={14} /> Files
+                                </button>
+                                <button onClick={() => { setNetworkInstance(inst.name); setMenuOpen(null); }} className="w-full text-left px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 flex items-center gap-2">
+                                    <Network size={14} /> Network
+                                </button>
+                                <button onClick={() => { setSnapshotInstance(inst.name); setMenuOpen(null); }} className="w-full text-left px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 flex items-center gap-2">
+                                    <HardDrive size={14} /> Backups
+                                </button>
+                                <div className="h-px bg-zinc-800 my-1"></div>
+                                <button onClick={() => { setShowSettings(prev => ({ ...prev, [inst.name]: true })); setMenuOpen(null); }} className="w-full text-left px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 flex items-center gap-2">
+                                    <Settings size={14} /> Settings
+                                </button>
+                                <button onClick={() => { handleDeleteInstance(inst.name); setMenuOpen(null); }} className="w-full text-left px-4 py-2 text-sm text-red-400 hover:bg-red-500/10 hover:text-red-300 flex items-center gap-2">
+                                    <Trash2 size={14} /> Delete
+                                </button>
+                            </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* Settings Panel (Moved inside) */}
+                {isSettingsOpen && (
+                    <div className="mb-6 p-4 bg-black/40 rounded-lg border border-zinc-800 space-y-5 animate-in fade-in slide-in-from-top-2 duration-200">
+                        <div className="flex justify-between items-center pb-2 border-b border-zinc-800/50">
+                            <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">Resource Limits</span>
+                            <button onClick={() => setShowSettings(prev => ({ ...prev, [inst.name]: false }))} className="text-zinc-500 hover:text-zinc-300"><X size={14}/></button>
+                        </div>
+                        <div>
+                            <div className="flex justify-between items-center mb-2"><span className="text-xs font-medium text-zinc-400">RAM Limit</span><span className="text-xs font-mono text-indigo-400">{inputs.memoryInput} MB</span></div>
+                            <input type="range" min="128" max="4096" step="128" value={inputs.memoryInput} onMouseDown={() => draggingRef.current[inst.name] = true} onMouseUp={() => draggingRef.current[inst.name] = false} onChange={(e) => handleSliderChange(inst.name, 'memory', parseInt(e.target.value))} className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-indigo-500 hover:accent-indigo-400" />
+                        </div>
+                        <div>
+                            <div className="flex justify-between items-center mb-2"><span className="text-xs font-medium text-zinc-400">vCPU Limit</span><span className="text-xs font-mono text-indigo-400">{inputs.cpuInput} Cores</span></div>
+                            <input type="range" min="1" max="4" step="1" value={inputs.cpuInput} onMouseDown={() => draggingRef.current[inst.name] = true} onMouseUp={() => draggingRef.current[inst.name] = false} onChange={(e) => handleSliderChange(inst.name, 'cpu', parseInt(e.target.value))} className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-indigo-500 hover:accent-indigo-400" />
+                        </div>
+                        <div className="flex justify-end pt-1">
+                            {inputs.isDirty && (
+                                <button onClick={() => handleApplyLimits(inst.name)} className="flex items-center gap-2 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-md shadow-lg shadow-indigo-500/20 transition-all active:scale-95">
+                                    <Save size={12} /> Apply Changes
+                                </button>
+                            )}
+                        </div>
+                    </div>
+                )}
+
+                {/* Metrics */}
+                <div className="grid grid-cols-2 gap-3 mb-6">
+                  <div className="bg-zinc-950/30 p-3 rounded-lg border border-zinc-800/50">
+                    <div className="flex items-center gap-2 mb-1 text-zinc-500"><Zap size={12} strokeWidth={1.5} /><span className="text-[10px] uppercase tracking-wider font-semibold">CPU Time</span></div>
+                    <p className="text-sm font-mono text-zinc-200">{inst.cpu_usage_seconds}s</p>
+                  </div>
+                  <div className="bg-zinc-900/30 p-3 rounded-lg border border-zinc-800/50">
+                    <div className="flex items-center gap-2 mb-1 text-zinc-500"><Cpu size={12} strokeWidth={1.5} /><span className="text-[10px] uppercase tracking-wider font-semibold">Memory</span></div>
+                    <p className="text-sm font-mono text-zinc-200">{formatBytes(inst.memory_usage_bytes)}</p>
+                  </div>
+                </div>
+
+                {/* Chart */}
+                <div className="h-20 w-full -mx-2 mt-auto opacity-80 hover:opacity-100 transition-opacity">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={histData}>
+                      <defs><linearGradient id={`gradient-${inst.name}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#6366f1" stopOpacity={0.2}/><stop offset="100%" stopColor="#6366f1" stopOpacity={0}/></linearGradient></defs>
+                      <Tooltip contentStyle={{ backgroundColor: '#09090b', borderColor: '#27272a', color: '#e4e4e7', borderRadius: '8px', fontSize: '12px', padding: '6px 10px', boxShadow: '0 4px 12px rgba(0,0,0,0.5)' }} itemStyle={{ color: '#818cf8', padding: 0 }} labelStyle={{ display: 'none' }} cursor={{ stroke: '#3f3f46', strokeWidth: 1 }} formatter={(value: number) => [`${value} MB`, '']} />
+                      <Area type="monotone" dataKey="memoryMB" stroke="#6366f1" strokeWidth={1.5} fill={`url(#gradient-${inst.name})`} isAnimationActive={false} />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
