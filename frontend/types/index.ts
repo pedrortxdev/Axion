@@ -16,6 +16,15 @@ export interface Job {
   requested_by?: string;
 }
 
+export interface Schedule {
+  id: string;
+  cron_expr: string;
+  type: JobType;
+  target: string;
+  payload: string;
+  created_at: string;
+}
+
 export interface InstanceConfig {
   "limits.memory"?: string;
   "limits.cpu"?: string;
@@ -35,6 +44,7 @@ export interface InstanceDevices {
 }
 
 export interface InstanceMetric {
+  location?: string;
   name: string;
   status: string;
   memory_usage_bytes: number;

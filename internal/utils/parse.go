@@ -12,24 +12,24 @@ func ParseMemoryToMB(memStr string) int64 {
 	if memStr == "" {
 		return 0
 	}
-	
+
 	// Remove espaços e converte para upper
 	s := strings.ToUpper(strings.TrimSpace(memStr))
-	
+
 	re := regexp.MustCompile(`^(\d+)(MB|GB|G|M)?$`)
 	matches := re.FindStringSubmatch(s)
-	
+
 	if len(matches) < 2 {
 		return 0
 	}
-	
+
 	val, err := strconv.ParseInt(matches[1], 10, 64)
 	if err != nil {
 		return 0
 	}
-	
+
 	unit := matches[2]
-	
+
 	switch unit {
 	case "GB", "G":
 		return val * 1024

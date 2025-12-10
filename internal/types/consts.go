@@ -19,7 +19,7 @@ const (
 	JobTypeUpdateLimits   JobType = "update_limits"
 	JobTypeCreateInstance JobType = "create_instance"
 	JobTypeDeleteInstance JobType = "delete_instance"
-	
+
 	// Snapshot Jobs
 	JobTypeCreateSnapshot  JobType = "create_snapshot"
 	JobTypeRestoreSnapshot JobType = "restore_snapshot"

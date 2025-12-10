@@ -32,7 +32,7 @@ type Job struct {
 func Init(dbPath string) error {
 	var err error
 	dsn := fmt.Sprintf("%s?_busy_timeout=5000&_foreign_keys=1", dbPath)
-	
+
 	DB, err = sql.Open("sqlite3", dsn)
 	if err != nil {
 		return fmt.Errorf("erro ao abrir banco de dados: %w", err)
@@ -87,7 +87,7 @@ func RecoverStuckJobs() error {
 	if err != nil {
 		return err
 	}
-	
+
 	rows, _ := res.RowsAffected()
 	if rows > 0 {
 		log.Printf("[DB Recovery] %d jobs presos foram reiniciados para PENDING", rows)
@@ -133,7 +133,7 @@ func MarkJobFailed(id string, errorMsg string, isFatal bool) error {
 	if isFatal {
 		status = types.JobFailed
 	}
-	
+
 	if isFatal {
 		query := `
 		UPDATE jobs 
@@ -160,12 +160,12 @@ func GetJob(id string) (*Job, error) {
 	var job Job
 	var errStr sql.NullString
 	var reqByStr sql.NullString
-	
+
 	err := row.Scan(&job.ID, &job.Type, &job.Target, &job.Payload, &job.Status, &errStr, &job.CreatedAt, &job.StartedAt, &job.FinishedAt, &job.AttemptCount, &reqByStr)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if errStr.Valid {
 		s := errStr.String
 		job.Error = &s
@@ -200,7 +200,7 @@ func ListRecentJobs(limit int) ([]Job, error) {
 		if err := rows.Scan(&job.ID, &job.Type, &job.Target, &job.Payload, &job.Status, &errStr, &job.CreatedAt, &job.StartedAt, &job.FinishedAt, &job.AttemptCount, &reqByStr); err != nil {
 			return nil, err
 		}
-		
+
 		if errStr.Valid {
 			s := errStr.String
 			job.Error = &s
@@ -209,7 +209,7 @@ func ListRecentJobs(limit int) ([]Job, error) {
 			s := reqByStr.String
 			job.RequestedBy = &s
 		}
-		
+
 		jobs = append(jobs, job)
 	}
 	return jobs, nil

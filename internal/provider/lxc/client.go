@@ -23,6 +23,7 @@ type InstanceService struct {
 }
 
 type InstanceMetric struct {
+	Location         string                       `json:"location"`
 	Name             string                       `json:"name"`
 	Status           string                       `json:"status"`
 	MemoryUsageBytes int64                        `json:"memory_usage_bytes"`
@@ -42,6 +43,43 @@ type FileEntry struct {
 }
 
 func NewClient() (*InstanceService, error) {
+	// Check for TLS environment variables
+	lxdURL := os.Getenv("AXION_LXD_URL")
+	certPath := os.Getenv("AXION_CERT_PATH")
+	keyPath := os.Getenv("AXION_KEY_PATH")
+
+	// If all TLS environment variables are set, use TLS connection
+	if lxdURL != "" && certPath != "" && keyPath != "" {
+		// Read certificate and key files
+		cert, err := os.ReadFile(certPath)
+		if err != nil {
+			return nil, fmt.Errorf("falha ao ler certificado TLS: %w", err)
+		}
+
+		key, err := os.ReadFile(keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("falha ao ler chave TLS: %w", err)
+		}
+
+		// Create connection arguments for TLS
+		args := lxd.ConnectionArgs{
+			TLSClientCert:      string(cert),
+			TLSClientKey:       string(key),
+			InsecureSkipVerify: true, // Accept self-signed certificates for clustering
+		}
+
+		c, err := lxd.ConnectLXD(lxdURL, &args)
+		if err != nil {
+			return nil, fmt.Errorf("falha ao conectar via TLS ao cluster LXD: %w", err)
+		}
+
+		log.Printf("Conectado via TLS Cluster Mode em %s", lxdURL)
+		return &InstanceService{
+			server: c,
+		}, nil
+	}
+
+	// Fallback to Unix socket connection
 	const socketPath = "/var/snap/lxd/common/lxd/unix.socket"
 
 	if info, err := os.Stat(socketPath); err != nil {
@@ -65,6 +103,7 @@ func NewClient() (*InstanceService, error) {
 		return nil, fmt.Errorf("falha ao conectar no socket Unix do LXD: %w", err)
 	}
 
+	log.Println("Conectado via Unix Socket (Modo Local)")
 	return &InstanceService{
 		server: c,
 	}, nil
@@ -109,10 +148,10 @@ func (s *InstanceService) ExecInteractive(name string, cmd []string, stdin io.Re
 	}
 
 	args := lxd.InstanceExecArgs{
-		Stdin:    stdin,
-		Stdout:   stdout,
-		Stderr:   stderr,
-		Control:  controlHandler,
+		Stdin:   stdin,
+		Stdout:  stdout,
+		Stderr:  stderr,
+		Control: controlHandler,
 	}
 
 	log.Printf("[LXD Provider] Iniciando terminal interativo em '%s'", name)
@@ -191,6 +230,7 @@ func (s *InstanceService) ListInstances() ([]InstanceMetric, error) {
 		}
 
 		metrics = append(metrics, InstanceMetric{
+			Location:         inst.Location,
 			Name:             inst.Name,
 			Status:           inst.Status,
 			MemoryUsageBytes: memBytes,
@@ -290,42 +330,46 @@ func (s *InstanceService) UpdateInstanceLimits(name string, memoryLimit string, 
 	}
 }
 
-// CreateInstance cria um novo container a partir de uma imagem LOCAL.
-// Agora suporta Cloud-Init (userData).
-func (s *InstanceService) CreateInstance(name string, imageAlias string, limits map[string]string, userData string) error {
+// CreateInstance cria um novo container ou VM a partir de uma imagem LOCAL com suporte a Cloud-Init.
+func (s *InstanceService) CreateInstance(name string, imageAlias string, instanceType string, limits map[string]string, userData string) error {
+	// 1. Lock check...
 	if _, busy := s.locks.LoadOrStore(name, true); busy {
-		return fmt.Errorf("LOCKED: já existe uma operação em andamento para criar '%s'", name)
+		return fmt.Errorf("LOCKED: %s está ocupado", name)
 	}
 	defer s.locks.Delete(name)
 
-	cleanImageAlias := strings.TrimPrefix(imageAlias, "images:")
-
-	log.Printf("[LXD Provider] Verificando existência local da imagem '%s'...", cleanImageAlias)
-
-	_, _, err := s.server.GetImageAlias(cleanImageAlias)
-	if err != nil {
-		return fmt.Errorf("CRITICAL: imagem '%s' não encontrada localmente no servidor LXD. O download remoto está desativado. Erro: %v", cleanImageAlias, err)
+	// 2. Ajuste de Alias da Imagem (Lógica Inteligente)
+	// Se for VM e o alias não terminar em "-vm", adicione "-vm" para achar a imagem correta.
+	finalAlias := imageAlias
+	if instanceType == "virtual-machine" && !strings.HasSuffix(imageAlias, "-vm") {
+		finalAlias = imageAlias + "-vm"
 	}
 
-	log.Printf("[LXD Provider] Imagem local confirmada. Prosseguindo com criação de '%s'", name)
-
+	// 3. Configuração
 	config := make(map[string]string)
 	for k, v := range limits {
 		config[k] = v
 	}
 
-	// Adiciona Cloud-Init (user-data) se fornecido
-	if userData != "" {
-		log.Printf("[LXD Provider] Injetando user-data no container '%s'", name)
-		config["user.user-data"] = userData
+	// Configs específicas de VM
+	if instanceType == "virtual-machine" {
+		config["security.secureboot"] = "false"
+		config["agent.enabled"] = "true" // Vital para o File Manager funcionar
 	}
 
+	// Injeção Cloud-Init
+	if userData != "" {
+		config["user.user-data"] = userData
+		config["cloud-init.network-config"] = "version: 2\nethernets:\n  eth0:\n    dhcp4: true" // Garante rede
+	}
+
+	// 4. Source (Sempre Local, pois já fizemos preload)
 	req := api.InstancesPost{
 		Name: name,
-		Type: api.InstanceTypeContainer,
+		Type: api.InstanceType(instanceType),
 		Source: api.InstanceSource{
 			Type:  "image",
-			Alias: cleanImageAlias,
+			Alias: finalAlias, // Usa o alias corrigido
 		},
 		InstancePut: api.InstancePut{
 			Config:   config,
@@ -333,26 +377,19 @@ func (s *InstanceService) CreateInstance(name string, imageAlias string, limits 
 		},
 	}
 
+	// 5. Execução
+	log.Printf("[Create] Criando %s (%s) usando imagem '%s'...", name, instanceType, finalAlias)
 	op, err := s.server.CreateInstance(req)
 	if err != nil {
-		return fmt.Errorf("falha ao solicitar criação de container local: %w", err)
+		return fmt.Errorf("erro no LXD Create: %w", err)
+	}
+	if err := op.Wait(); err != nil {
+		return fmt.Errorf("erro ao aguardar criação: %w", err)
 	}
 
-	done := make(chan error, 1)
-	go func() {
-		done <- op.Wait()
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			return fmt.Errorf("erro durante a criação do container: %w", err)
-		}
-		log.Printf("[LXD Provider] Container '%s' criado com sucesso a partir de imagem local", name)
-		return nil
-	case <-time.After(2 * time.Minute):
-		return fmt.Errorf("TIMEOUT: criação local demorou muito")
-	}
+	// 6. Auto-Start (Opcional, mas Cloud-Init só roda no boot)
+	// Por enquanto, retorne sucesso.
+	return nil
 }
 
 func (s *InstanceService) DeleteInstance(name string) error {
@@ -462,7 +499,7 @@ func (s *InstanceService) RestoreSnapshot(instanceName string, snapshotName stri
 		if err := op.Wait(); err != nil {
 			return fmt.Errorf("erro ao aguardar parada: %w", err)
 		}
-		
+
 		inst, etag, _ = s.server.GetInstance(instanceName)
 	}
 
@@ -546,7 +583,7 @@ func (s *InstanceService) AddProxyDevice(instanceName string, hostPort int, cont
 
 	req := api.InstancePut{
 		Config:       inst.Config,
-		Devices:      inst.Devices, 
+		Devices:      inst.Devices,
 		Profiles:     inst.Profiles,
 		Description:  inst.Description,
 		Architecture: inst.Architecture,
@@ -672,20 +709,20 @@ func (s *InstanceService) UploadFile(instanceName string, path string, content i
 	if err != nil {
 		return fmt.Errorf("falha ao ler conteúdo do upload: %w", err)
 	}
-	
+
 	readSeeker := strings.NewReader(string(data))
 
 	args := lxd.InstanceFileArgs{
-		UID:     0,
-		GID:     0,
-		Mode:    0644,
-		Type:    "file",
-		Content: readSeeker,
+		UID:       0,
+		GID:       0,
+		Mode:      0644,
+		Type:      "file",
+		Content:   readSeeker,
 		WriteMode: "overwrite", // Força sobrescrita explícita
 	}
 
 	log.Printf("[LXD Provider] Uploading file to '%s:%s' (%d bytes)", instanceName, path, len(data))
-	
+
 	err = s.server.CreateInstanceFile(instanceName, path, args)
 	if err != nil {
 		return fmt.Errorf("falha no upload: %w", err)
@@ -697,10 +734,103 @@ func (s *InstanceService) UploadFile(instanceName string, path string, content i
 // DeleteFile deleta um arquivo ou diretório.
 func (s *InstanceService) DeleteFile(instanceName string, path string) error {
 	log.Printf("[LXD Provider] Deletando arquivo '%s:%s'", instanceName, path)
-	
+
 	err := s.server.DeleteInstanceFile(instanceName, path)
 	if err != nil {
 		return fmt.Errorf("falha ao deletar arquivo: %w", err)
 	}
 	return nil
+}
+
+// GetInstanceLog returns the console log of an instance (ringbuffer)
+func (s *InstanceService) GetInstanceLog(instanceName string) (string, error) {
+	logFile, err := s.server.GetInstanceLogfile(instanceName, "console")
+	if err != nil {
+		return "", fmt.Errorf("falha ao obter log do console para '%s': %w", instanceName, err)
+	}
+	defer logFile.Close()
+
+	content, err := io.ReadAll(logFile)
+	if err != nil {
+		return "", fmt.Errorf("falha ao ler log do console para '%s': %w", instanceName, err)
+	}
+
+	return string(content), nil
+}
+
+// ListNetworks returns a list of bridge networks
+func (s *InstanceService) ListNetworks() ([]api.Network, error) {
+	networks, err := s.server.GetNetworks()
+	if err != nil {
+		return nil, fmt.Errorf("falha ao listar redes: %w", err)
+	}
+
+	// Filter only 'bridge' type networks that are managed
+	var filteredNetworks []api.Network
+	for _, network := range networks {
+		if network.Type == "bridge" && network.Managed {
+			filteredNetworks = append(filteredNetworks, network)
+		}
+	}
+
+	return filteredNetworks, nil
+}
+
+// CreateNetwork creates a new bridge network
+func (s *InstanceService) CreateNetwork(name string, description string, ipv4Subnet string) error {
+	req := api.NetworksPost{
+		Name:        name,
+		Type:        "bridge",
+		Description: description,
+		Config: map[string]string{
+			"ipv4.address": ipv4Subnet,
+			"ipv4.nat":     "true",
+			"ipv6.address": "none",
+		},
+	}
+
+	err := s.server.CreateNetwork(req)
+	if err != nil {
+		return fmt.Errorf("falha ao criar rede %s: %w", name, err)
+	}
+
+	return nil
+}
+
+// DeleteNetwork deletes a network
+func (s *InstanceService) DeleteNetwork(name string) error {
+	err := s.server.DeleteNetwork(name)
+	if err != nil {
+		return fmt.Errorf("falha ao deletar rede %s: %w", name, err)
+	}
+
+	return nil
+}
+
+// GetClusterMembers returns a list of all cluster members with their status and roles
+func (s *InstanceService) GetClusterMembers() ([]api.ClusterMember, error) {
+	members, err := s.server.GetClusterMembers()
+	if err != nil {
+		// Check if the error is "not clustered" and handle it as a single-node cluster
+		if strings.Contains(err.Error(), "not clustered") {
+			// Get server information for the single node
+			server, _, err := s.server.GetServer()
+			if err != nil {
+				return nil, fmt.Errorf("falha ao obter informações do servidor: %w", err)
+			}
+
+			// Create a single cluster member representing this node
+			singleMember := api.ClusterMember{
+				ServerName: server.Environment.ServerName,
+				Status:     "Online",
+				Roles:      []string{"single-node"},
+				URL:        "", // Use empty string for URL as we don't have the host address readily available
+			}
+
+			return []api.ClusterMember{singleMember}, nil
+		}
+
+		return nil, fmt.Errorf("falha ao obter membros do cluster: %w", err)
+	}
+	return members, nil
 }

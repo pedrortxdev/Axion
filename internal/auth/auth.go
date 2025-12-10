@@ -125,7 +125,7 @@ func LoginHandler(c *gin.Context) {
 	}
 
 	c.JSON(200, gin.H{
-		"token": token,
+		"token":      token,
 		"expires_in": 86400,
 	})
 }

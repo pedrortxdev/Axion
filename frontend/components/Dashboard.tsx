@@ -2,7 +2,7 @@
 
 import React, { useEffect, useState, useRef } from 'react';
 import { AreaChart, Area, ResponsiveContainer, Tooltip } from 'recharts';
-import { Server, Cpu, Zap, Activity, Play, Square, RefreshCw, Loader2, Settings, Save, History, Wifi, WifiOff, Plus, SquareTerminal, Trash2, AlertTriangle, HardDrive, Network, FolderOpen, MoreVertical, X } from 'lucide-react';
+import { Server, Cpu, Zap, Activity, Play, Square, RefreshCw, Loader2, Settings, Save, History, Wifi, WifiOff, Plus, SquareTerminal, Trash2, AlertTriangle, HardDrive, Network, FolderOpen, MoreVertical, X, FileText, Globe } from 'lucide-react';
 import { toast, Toaster } from 'sonner';
 import { useRouter } from 'next/navigation';
 import ActivityDrawer from './ActivityDrawer';
@@ -11,6 +11,10 @@ import SnapshotDrawer from './SnapshotDrawer';
 import NetworkDrawer from './NetworkDrawer';
 import FileExplorerDrawer from './FileExplorerDrawer';
 import WebTerminal from './WebTerminal';
+import HostStatsCard from './HostStatsCard';
+import ClusterStatus from './ClusterStatus';
+import LogDrawer from './LogDrawer';
+import NetworkManagerModal from './NetworkManagerModal';
 import { Job, InstanceMetric } from '@/types';
 
 // --- Types Local ---
@@ -65,6 +69,7 @@ export default function Dashboard() {
   const [connected, setConnected] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<string>('-');
   const [token, setToken] = useState<string | null>(null);
+  const [hostStats, setHostStats] = useState<any>(null); // We'll use any to match the HostStats interface
   
   // UI State
   const [isActivityOpen, setIsActivityOpen] = useState(false);
@@ -73,9 +78,11 @@ export default function Dashboard() {
   const [networkInstance, setNetworkInstance] = useState<string | null>(null);
   const [fileInstance, setFileInstance] = useState<string | null>(null);
   const [terminalInstance, setTerminalInstance] = useState<string | null>(null);
+  const [logInstance, setLogInstance] = useState<string | null>(null);
+  const [showNetworkManager, setShowNetworkManager] = useState(false);
   const [showSettings, setShowSettings] = useState<Record<string, boolean>>({});
   const [resourceInputs, setResourceInputs] = useState<Record<string, ResourceState>>({});
-  
+
   // Menu State
   const [menuOpen, setMenuOpen] = useState<string | null>(null);
   
@@ -155,6 +162,9 @@ export default function Dashboard() {
         }
         if (rawData.type === 'job_update') {
             handleJobUpdate(rawData.payload as Job);
+        }
+        if (rawData.type === 'host_telemetry') {
+            setHostStats(rawData.data);
         }
       } catch (err) {
         console.error('WS parsing error:', err);
@@ -383,6 +393,8 @@ export default function Dashboard() {
       <SnapshotDrawer isOpen={!!snapshotInstance} onClose={() => setSnapshotInstance(null)} instanceName={snapshotInstance} />
       <NetworkDrawer isOpen={!!networkInstance} onClose={() => setNetworkInstance(null)} instance={metrics.find(m => m.name === networkInstance) || null} />
       <FileExplorerDrawer isOpen={!!fileInstance} onClose={() => setFileInstance(null)} instanceName={fileInstance} />
+      <LogDrawer isOpen={!!logInstance} onClose={() => setLogInstance(null)} instanceName={logInstance} token={token} />
+      <NetworkManagerModal isOpen={showNetworkManager} onClose={() => setShowNetworkManager(false)} token={token} />
       {terminalInstance && <WebTerminal instanceName={terminalInstance} onClose={() => setTerminalInstance(null)} />}
 
       <div className="max-w-7xl mx-auto p-6 md:p-12">
@@ -398,7 +410,7 @@ export default function Dashboard() {
               <p className="text-sm text-zinc-500">Event-driven orchestration</p>
             </div>
           </div>
-          
+
           <div className="flex items-center gap-4 mt-4 md:mt-0">
              <button onClick={() => setIsCreateModalOpen(true)} className="flex items-center gap-2 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-md text-sm font-medium shadow-lg shadow-indigo-900/20 transition-all hover:scale-[1.02]">
                 <Plus size={16} /><span>New Instance</span>
@@ -409,6 +421,9 @@ export default function Dashboard() {
                     <span className="flex h-2 w-2 relative ml-1"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span><span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span></span>
                 )}
              </button>
+             <button onClick={() => setShowNetworkManager(true)} className="group flex items-center gap-2 px-3 py-1.5 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 rounded-md text-sm text-zinc-400 hover:text-zinc-200 transition-all hover:border-zinc-700">
+                <Globe size={16} className="group-hover:text-indigo-400 transition-colors" /><span>Networks</span>
+             </button>
              <div className="h-6 w-px bg-zinc-900 mx-2"></div>
              <div className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-zinc-900/50 border border-zinc-800/50">
                 {connected ? <Wifi size={14} className="text-emerald-500" /> : <WifiOff size={14} className="text-red-500" />}
@@ -416,6 +431,16 @@ export default function Dashboard() {
              </div>
           </div>
         </header>
+
+        {/* Host Stats Card */}
+        <div className="mb-6">
+          <HostStatsCard data={hostStats} />
+        </div>
+
+        {/* Cluster Status */}
+        <div className="mb-6">
+          <ClusterStatus token={token} />
+        </div>
 
         {/* Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -439,7 +464,15 @@ export default function Dashboard() {
                       <Server size={18} strokeWidth={1.5} />
                     </div>
                     <div>
-                      <h3 className="text-sm font-semibold text-zinc-200 tracking-tight">{inst.name}</h3>
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-sm font-semibold text-zinc-200 tracking-tight">{inst.name}</h3>
+                        {inst.location && inst.location !== 'none' && inst.location.trim() !== '' && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-zinc-800 border border-zinc-700 rounded text-xs text-zinc-300 font-medium">
+                            <Server size={10} strokeWidth={1.5} />
+                            {inst.location}
+                          </span>
+                        )}
+                      </div>
                       <div className="flex items-center gap-1.5 mt-0.5">
                         <span className={`h-1.5 w-1.5 rounded-full ${isRunning ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'bg-zinc-600'}`}></span>
                         <span className="text-[10px] font-medium text-zinc-500 uppercase tracking-wider">{inst.status}</span>
@@ -487,6 +520,9 @@ export default function Dashboard() {
                                 </button>
                                 <button onClick={() => { setNetworkInstance(inst.name); setMenuOpen(null); }} className="w-full text-left px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 flex items-center gap-2">
                                     <Network size={14} /> Network
+                                </button>
+                                <button onClick={() => { setLogInstance(inst.name); setMenuOpen(null); }} className="w-full text-left px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 flex items-center gap-2">
+                                    <FileText size={14} /> System Logs
                                 </button>
                                 <button onClick={() => { setSnapshotInstance(inst.name); setMenuOpen(null); }} className="w-full text-left px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 flex items-center gap-2">
                                     <HardDrive size={14} /> Backups

@@ -56,7 +56,7 @@ func TerminalHandler(c *gin.Context, instanceService *lxc.InstanceService) {
 
 	// Controle: agora usando *websocket.Conn
 	controlCh := make(chan *websocket.Conn)
-	
+
 	go func() {
 		controlFunc := func(control *websocket.Conn) {
 			controlCh <- control
@@ -70,7 +70,7 @@ func TerminalHandler(c *gin.Context, instanceService *lxc.InstanceService) {
 			stdoutWriter,
 			controlFunc,
 		)
-		
+
 		if err != nil {
 			log.Printf("Terminal session ended with error: %v", err)
 			conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("\r\nSession ended: %v\r\n", err)))
@@ -102,7 +102,7 @@ func TerminalHandler(c *gin.Context, instanceService *lxc.InstanceService) {
 				Cols int    `json:"cols"`
 				Rows int    `json:"rows"`
 			}
-		
+
 			// Se for resize, enviamos para o canal de controle do LXD
 			// O protocolo LXD espera JSON: { "command": "window-resize", "width": ..., "height": ... }
 			if err := json.Unmarshal(message, &msg); err == nil && msg.Type == "resize" {
@@ -116,7 +116,7 @@ func TerminalHandler(c *gin.Context, instanceService *lxc.InstanceService) {
 				}
 				continue
 			}
-			
+
 			stdinWriter.Write(message)
 		} else {
 			stdinWriter.Write(message)

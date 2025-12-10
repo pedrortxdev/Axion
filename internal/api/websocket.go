@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"aexon/internal/events"
+	"aexon/internal/monitor"
 	"aexon/internal/provider/lxc"
 
 	"github.com/gin-gonic/gin"
@@ -43,7 +44,7 @@ func StreamTelemetry(c *gin.Context, instanceService *lxc.InstanceService) {
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
-		
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -54,7 +55,7 @@ func StreamTelemetry(c *gin.Context, instanceService *lxc.InstanceService) {
 					log.Printf("Erro ao coletar métricas: %v", err)
 					continue
 				}
-				
+
 				// Tenta enviar. Se o contexto for cancelado ou buffer cheio, desiste.
 				select {
 				case sendChan <- metrics:
@@ -62,6 +63,25 @@ func StreamTelemetry(c *gin.Context, instanceService *lxc.InstanceService) {
 					return
 				default:
 					// Buffer cheio, drop metric frame
+				}
+
+				// Get and send host stats
+				hostStats, err := monitor.GetHostStats()
+				if err != nil {
+					log.Printf("Erro ao coletar estatísticas do host: %v", err)
+				} else {
+					hostTelemetry := map[string]interface{}{
+						"type": "host_telemetry",
+						"data": hostStats,
+					}
+
+					select {
+					case sendChan <- hostTelemetry:
+					case <-ctx.Done():
+						return
+					default:
+						// Buffer cheio, drop host telemetry frame
+					}
 				}
 			}
 		}

@@ -150,11 +150,17 @@ func executeLogic(ctx context.Context, job *db.Job, lxcClient *lxc.InstanceServi
 				Image    string            `json:"image"`
 				Limits   map[string]string `json:"limits"`
 				UserData string            `json:"user_data"` // Adicionado suporte a user_data
+				Type     string            `json:"type"`      // Instance type: "container" or "virtual-machine"
 			}
 			if e := json.Unmarshal([]byte(job.Payload), &payload); e != nil {
 				err = fmt.Errorf("payload inválido: %v", e)
 			} else {
-				err = lxcClient.CreateInstance(payload.Name, payload.Image, payload.Limits, payload.UserData)
+				// If Type is empty, default to "container"
+				instanceType := payload.Type
+				if instanceType == "" {
+					instanceType = "container"
+				}
+				err = lxcClient.CreateInstance(payload.Name, payload.Image, instanceType, payload.Limits, payload.UserData)
 			}
 
 		case types.JobTypeDeleteInstance:
