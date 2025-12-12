@@ -16,7 +16,7 @@ O **Axion** é um control plane de containers e virtualização focado em **perf
 ![Build](https://img.shields.io/badge/Build-Passing-brightgreen)
 
 ✅ **Backend & Frontend Operacionais**
-✅ **Containers LXC em Produção**
+✅ **Containers LXC & VMs KVM em Produção**
 ✅ **Cluster Mode (TLS) Ativo**
 
 O Axion já é um Control Plane completo, oferecendo ciclo de vida total de instâncias, orquestração de rede e armazenamento, e ferramentas de operação "Day 2" (Terminal, Arquivos, Logs).
@@ -38,9 +38,9 @@ O Axion já é um Control Plane completo, oferecendo ciclo de vida total de inst
 ### Backend (The Engine)
 * **Core:** Go (Golang) 1.25+
 * **API:** Gin Framework (High Performance HTTP)
-* **Database:** SQLite (WAL Mode) com auto-recovery.
+* **Database:** SQLite (WAL Mode) com auto-recovery para persistência de Jobs e Schedules.
 * **Orquestração:** LXD via Socket Unix (Local) ou TLS (Cluster).
-* **Async System:** Worker Pool com filas persistentes, retry exponencial e locks por instância.
+* **Async System:** Worker Pool com filas persistentes, retry exponencial e locks por instância para evitar race conditions.
 
 ### Frontend (The Cockpit)
 * **Framework:** Next.js 16 (App Router)
@@ -86,39 +86,40 @@ npm run dev
 
 ---
 
-## ⚡ Funcionalidades (O que já funciona)
+## ⚡ Funcionalidades (Implementadas)
 
 ### 🖥️ Compute & Orquestração
-* **Containers LXC:** Criação, Start, Stop, Restart e Delete instantâneos.
-* **Cloud-Init Templates:** Deploy automático de stacks (Docker Host, Web Server) via *user-data*.
-* **Hotplug de Recursos:** Ajuste dinâmico de vCPU e RAM sem reiniciar.
-* **Cluster Awareness:** Suporte a múltiplos nós via conexão TLS segura.
-* **Host Telemetry:** Monitoramento visual de CPU/RAM/Disk/Network do servidor físico ("Telemetry Deck").
+* **LXC & KVM:** Suporte nativo a Containers (`container`) e Virtual Machines (`virtual-machine`).
+* **Cloud-Init:** Injeção automática de `user-data` para configuração inicial de rede e pacotes.
+* **Resource Limits:** Controle rígido de vCPU e RAM por instância.
+* **Global Quotas:** Sistema de governança que impede over-provisioning do host (Limites globais hardcoded para segurança).
+* **Cluster Awareness:** Conexão segura via TLS para gerenciamento de múltiplos nós LXD.
+* **Host Telemetry:** Monitoramento em tempo real de CPU, RAM, Disco e Rede do servidor físico via WebSocket.
 
 ### 💾 Storage & Arquivos
-* **Snapshots (Time Machine):** Criar, Restaurar e Deletar backups instantâneos (ZFS/LVM).
-* **Axion Explorer:** Gerenciador de arquivos completo no navegador.
-* **Integrated IDE:** Edição de arquivos de configuração com **Monaco Editor** (VS Code engine) e syntax highlighting.
-* **Transfer:** Upload e Download de arquivos direto pelo painel.
+* **Snapshots (Time Machine):** Criar, Restaurar e Deletar backups instantâneos das instâncias.
+* **Axion Explorer:** Gerenciador de arquivos completo (Listar, Upload, Download, Deletar).
+* **Integrated IDE:** Edição de arquivos de configuração com **Monaco Editor** direto no navegador.
+* **Streaming Upload/Download:** Transferência eficiente de arquivos grandes.
 
 ### 🌐 Rede & Conectividade
-* **Network Manager:** Criação e gestão de Bridges e Redes virtuais.
-* **Port Forwarding:** Mapeamento visual de portas (Host -> Container) usando Proxy Devices.
-* **Boot Logs:** Visualizador "Matrix" de logs do console para debug de inicialização.
+* **Port Forwarding:** Criação de Proxy Devices para mapear portas do Host (10000-60000) para Containers/VMs (TCP/UDP).
+* **Network Manager:** Gestão completa de Bridges e Subnets.
+* **Boot Logs:** Acesso aos logs de console da instância para debug.
 
 ### 🛡️ Segurança & Governança
-* **Autenticação:** JWT com rotação e expiração de 24h.
-* **Resource Quotas:** Tetos globais de CPU e RAM para proteger o Host.
-* **Web Terminal:** Acesso root via WebSocket binário (xterm.js) sem necessidade de SSH exposto.
+* **Autenticação:** JWT com expiração de 24h e suporte a rotação de segredos via ENV.
+* **Web Terminal:** Acesso root interativo via WebSocket binário (xterm.js) com suporte a redimensionamento de janela.
+* **Job System:** Fila de tarefas persistente em SQLite com recuperação automática de falhas e sistema de retry inteligente.
 
 ---
 
-## ⚙️ Automação (Job System)
+## ⚙️ Automação (Scheduler)
 
-O coração do Axion é um motor de Jobs resiliente:
-1.  **Estados:** `PENDING` -> `IN_PROGRESS` -> `COMPLETED` / `FAILED`.
-2.  **Resiliência:** Se o servidor reiniciar, jobs travados são recuperados automaticamente.
-3.  **Cron Scheduler:** Agendamento de tarefas recorrentes (ex: Snapshots diários).
+O Axion possui um **Scheduler Integrado** persistente:
+1.  **Cron Expressions:** Agendamento de tarefas recorrentes usando sintaxe padrão Cron.
+2.  **Persistence:** Agendamentos salvos no banco SQLite, sobrevivendo a reinícios.
+3.  **Job Dispatch:** O scheduler dispara Jobs para a fila do Worker Pool automaticamente.
 
 ---
 
@@ -142,10 +143,10 @@ O **Axion NÃO é open-source completo**.
 
 ## 🧭 Roadmap
 
-* [x] **v1.0 (Atual):** Containers, Rede, Storage, Terminal, Cloud-Init, Cluster Mode.
-* [ ] **v1.1:** Suporte completo a KVM/VMs (Windows/Linux).
-* [ ] **v1.2:** Firewall por instância e Security Groups.
-* [ ] **v2.0:** Multi-tenant (SaaS Mode), Billing Hooks e HA (Alta Disponibilidade).
+* [x] **v1.0 (Atual):** Containers/VMs, Rede, Storage, Terminal, Cloud-Init, Cluster Mode, Scheduler.
+* [ ] **v1.1:** Firewall por instância e Security Groups.
+* [ ] **v1.2:** Multi-tenant (SaaS Mode) e Billing Hooks.
+* [ ] **v2.0:** HA (Alta Disponibilidade) e Live Migration.
 
 ---
 
