@@ -365,6 +365,8 @@ func (s *InstanceService) CreateInstance(name string, imageAlias string, instanc
 
     if userData != "" {
         config["user.user-data"] = userData
+        // FIX: Configuração de rede universal (funciona para eth0 e enp5s0)
+        config["cloud-init.network-config"] = "version: 2\nethernets:\n  all-interfaces:\n    match:\n      name: \"e*\"\n    dhcp4: true"
     }
 
     req := api.InstancesPost{

@@ -37,27 +37,27 @@ const getCpuLoadColor = (percent: number) => {
 export default function HostStatsCard({ data }: HostStatsCardProps) {
   if (!data) {
     return (
-      <div className="h-24 bg-zinc-900/50 backdrop-blur rounded-lg border border-zinc-800 flex overflow-hidden">
-        <div className="flex-1 border-r border-white/5 p-3">
-          <div className="h-3 bg-zinc-800/50 rounded mb-2 w-1/3"></div>
-          <div className="h-6 bg-zinc-800/50 rounded mb-2 w-1/4"></div>
+      <div className="bg-zinc-900/30 backdrop-blur-sm rounded-xl border border-zinc-800 flex flex-col md:flex-row divide-y md:divide-y-0 md:divide-x divide-zinc-800 overflow-hidden">
+        <div className="flex-1 p-5">
+          <div className="h-3 bg-zinc-800/50 rounded mb-4 w-1/3"></div>
+          <div className="h-8 bg-zinc-800/50 rounded mb-4 w-1/4"></div>
           <div className="h-2 bg-zinc-800/50 rounded w-1/2"></div>
         </div>
-        <div className="flex-1 border-r border-white/5 p-3">
-          <div className="h-3 bg-zinc-800/50 rounded mb-2 w-1/3"></div>
-          <div className="h-6 bg-zinc-800/50 rounded mb-2 w-1/4"></div>
+        <div className="flex-1 p-5">
+          <div className="h-3 bg-zinc-800/50 rounded mb-4 w-1/3"></div>
+          <div className="h-8 bg-zinc-800/50 rounded mb-4 w-1/4"></div>
           <div className="h-2 bg-zinc-800/50 rounded w-1/2"></div>
         </div>
-        <div className="flex-1 border-r border-white/5 p-3">
-          <div className="h-3 bg-zinc-800/50 rounded mb-2 w-1/3"></div>
-          <div className="h-6 bg-zinc-800/50 rounded mb-2 w-1/4"></div>
+        <div className="flex-1 p-5">
+          <div className="h-3 bg-zinc-800/50 rounded mb-4 w-1/3"></div>
+          <div className="h-8 bg-zinc-800/50 rounded mb-4 w-1/4"></div>
           <div className="h-2 bg-zinc-800/50 rounded w-1/2"></div>
         </div>
-        <div className="flex-1 p-3">
-          <div className="h-3 bg-zinc-800/50 rounded mb-2 w-1/3"></div>
+        <div className="flex-1 p-5">
+          <div className="h-3 bg-zinc-800/50 rounded mb-4 w-1/3"></div>
           <div className="flex gap-4">
-            <div className="h-6 bg-zinc-800/50 rounded w-1/4"></div>
-            <div className="h-6 bg-zinc-800/50 rounded w-1/4"></div>
+            <div className="h-8 bg-zinc-800/50 rounded w-1/4"></div>
+            <div className="h-8 bg-zinc-800/50 rounded w-1/4"></div>
           </div>
         </div>
       </div>
@@ -124,80 +124,96 @@ export default function HostStatsCard({ data }: HostStatsCardProps) {
   const highNetworkTraffic = netRxKB > 5000 || netTxKB > 5000; // Threshold is arbitrary, can be adjusted
 
   return (
-    <div className="h-24 bg-zinc-900/50 backdrop-blur rounded-lg border border-zinc-800 flex overflow-hidden">
+    <div className="bg-zinc-900/30 backdrop-blur-sm rounded-xl border border-zinc-800 flex flex-col md:flex-row divide-y md:divide-y-0 md:divide-x divide-zinc-800 overflow-hidden">
       {/* CPU Section */}
-      <div className="flex-1 border-r border-white/5 p-3 flex flex-col justify-between">
+      <div className="flex-1 p-5 flex flex-col justify-between gap-4">
         <div>
-          <p className="text-xs tracking-widest text-zinc-500">CPU LOAD</p>
-          <p className="text-2xl font-mono text-zinc-100">{cpuPercent.toFixed(1)}%</p>
+          <div className="flex items-center gap-2 mb-1">
+             <Cpu size={14} className="text-zinc-500" />
+             <span className="text-[10px] uppercase tracking-wider font-semibold text-zinc-500">CPU Load</span>
+          </div>
+          <p className="text-2xl font-mono text-zinc-200">{cpuPercent.toFixed(1)}%</p>
         </div>
-        <div className="w-full bg-zinc-800/50 rounded-full h-1">
-          <div
-            className={clsx(
-              "h-1 rounded-full bg-gradient-to-r",
-              getCpuLoadColor(cpuPercent)
-            )}
-            style={{ width: `${Math.min(cpuPercent, 100)}%` }}
-          ></div>
+        <div>
+          <div className="w-full bg-zinc-800/50 rounded-full h-1.5 mb-2">
+            <div
+              className={clsx(
+                "h-1.5 rounded-full bg-gradient-to-r",
+                getCpuLoadColor(cpuPercent)
+              )}
+              style={{ width: `${Math.min(cpuPercent, 100)}%` }}
+            ></div>
+          </div>
+          <p className="text-xs text-zinc-500 font-medium">
+            {cpuModel || `${cpuCores} Cores`}
+          </p>
         </div>
-        <p className="text-xs text-zinc-500">
-          {cpuModel || `${cpuCores} Cores`}
-        </p>
       </div>
 
       {/* RAM Section */}
-      <div className="flex-1 border-r border-white/5 p-3 flex flex-col justify-between">
+      <div className="flex-1 p-5 flex flex-col justify-between gap-4">
         <div>
-          <p className="text-xs tracking-widest text-zinc-500">MEMORY</p>
-          <p className="text-2xl font-mono text-zinc-100">{memoryUsedGBStr} GB / {memoryTotalGBStr} GB</p>
+          <div className="flex items-center gap-2 mb-1">
+             <MemoryStick size={14} className="text-zinc-500" />
+             <span className="text-[10px] uppercase tracking-wider font-semibold text-zinc-500">Memory</span>
+          </div>
+          <p className="text-2xl font-mono text-zinc-200">{memoryUsedGBStr} <span className="text-sm text-zinc-500 font-sans ml-1">/ {memoryTotalGBStr} GB</span></p>
         </div>
-        <div className="w-full bg-zinc-800/50 rounded-full h-1">
+        <div className="w-full bg-zinc-800/50 rounded-full h-1.5">
           <div
-            className="h-1 rounded-full bg-gradient-to-r from-indigo-500 to-violet-500"
+            className="h-1.5 rounded-full bg-gradient-to-r from-indigo-500 to-violet-500"
             style={{ width: `${Math.min(memoryPercent, 100)}%` }}
           ></div>
         </div>
       </div>
 
       {/* STORAGE Section */}
-      <div className="flex-1 border-r border-white/5 p-3 flex flex-col justify-between">
+      <div className="flex-1 p-5 flex flex-col justify-between gap-4">
         <div>
-          <p className="text-xs tracking-widest text-zinc-500">LOCAL DISK</p>
-          <p className="text-2xl font-mono text-zinc-100">{diskPercent.toFixed(1)}%</p>
+          <div className="flex items-center gap-2 mb-1">
+             <HardDrive size={14} className="text-zinc-500" />
+             <span className="text-[10px] uppercase tracking-wider font-semibold text-zinc-500">Local Disk</span>
+          </div>
+          <p className="text-2xl font-mono text-zinc-200">{diskPercent.toFixed(1)}%</p>
         </div>
-        <div className="w-full bg-zinc-800/50 rounded-full h-1">
-          <div
-            className="h-1 rounded-full bg-gradient-to-r from-emerald-500 to-emerald-400"
-            style={{ width: `${Math.min(diskPercent, 100)}%` }}
-          ></div>
+        <div>
+          <div className="w-full bg-zinc-800/50 rounded-full h-1.5 mb-2">
+            <div
+              className="h-1.5 rounded-full bg-gradient-to-r from-emerald-500 to-emerald-400"
+              style={{ width: `${Math.min(diskPercent, 100)}%` }}
+            ></div>
+          </div>
+          <p className="text-xs text-zinc-500 font-medium">
+            Free: {diskFreeGB.toFixed(2)} GB
+          </p>
         </div>
-        <p className="text-xs text-zinc-500">
-          Free: {diskFreeGB.toFixed(2)} GB
-        </p>
       </div>
 
       {/* NETWORK Section */}
-      <div className="flex-1 p-3 flex flex-col justify-between">
+      <div className="flex-1 p-5 flex flex-col justify-between gap-4">
         <div>
-          <p className="text-xs tracking-widest text-zinc-500">I/O TRAFFIC</p>
-          <div className="flex items-end gap-4">
-            <div className="flex items-center gap-1">
-              <span className="text-blue-400 text-2xl font-mono">▼</span>
-              <span className="text-blue-400 text-lg font-mono">{netRxKB} KB/s</span>
+          <div className="flex items-center justify-between mb-1">
+            <div className="flex items-center gap-2">
+                <Activity size={14} className="text-zinc-500" />
+                <span className="text-[10px] uppercase tracking-wider font-semibold text-zinc-500">I/O Traffic</span>
             </div>
-            <div className="flex items-center gap-1">
-              <span className="text-emerald-400 text-2xl font-mono">▲</span>
-              <span className="text-emerald-400 text-lg font-mono">{netTxKB} KB/s</span>
+            <Activity 
+                className={clsx(
+                "h-4 w-4 text-zinc-500",
+                highNetworkTraffic && "animate-pulse text-blue-400"
+                )} 
+            />
+          </div>
+          <div className="flex flex-col gap-1 mt-2">
+            <div className="flex items-center gap-2">
+              <span className="text-blue-400 text-xs">▼</span>
+              <span className="text-zinc-200 font-mono text-lg">{netRxKB} <span className="text-xs text-zinc-500 font-sans">KB/s</span></span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-emerald-400 text-xs">▲</span>
+              <span className="text-zinc-200 font-mono text-lg">{netTxKB} <span className="text-xs text-zinc-500 font-sans">KB/s</span></span>
             </div>
           </div>
-        </div>
-        <div className="flex justify-end">
-          <Activity 
-            className={clsx(
-              "h-4 w-4 text-zinc-500",
-              highNetworkTraffic && "animate-pulse text-blue-400"
-            )} 
-          />
         </div>
       </div>
     </div>
