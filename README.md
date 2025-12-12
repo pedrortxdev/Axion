@@ -36,16 +36,53 @@ O Axion já é um Control Plane completo, oferecendo ciclo de vida total de inst
 ## 🏗️ Stack Tecnológico
 
 ### Backend (The Engine)
-* **Core:** Go (Golang) 1.22+
+* **Core:** Go (Golang) 1.25+
 * **API:** Gin Framework (High Performance HTTP)
 * **Database:** SQLite (WAL Mode) com auto-recovery.
 * **Orquestração:** LXD via Socket Unix (Local) ou TLS (Cluster).
 * **Async System:** Worker Pool com filas persistentes, retry exponencial e locks por instância.
 
 ### Frontend (The Cockpit)
-* **Framework:** Next.js 14 (App Router)
-* **UI Library:** Tailwind CSS + Radix UI + Lucide Icons.
+* **Framework:** Next.js 16 (App Router)
+* **UI Library:** Tailwind CSS + Lucide Icons + Sonner.
 * **Features:** Sidebar Navigation, Monaco Editor integrado, Terminal xterm.js, Telemetria em tempo real (Recharts).
+
+---
+
+## 🛠️ Instalação e Execução
+
+### Pré-requisitos
+* **Linux** (Ubuntu 22.04/24.04 recomendado)
+* **Go 1.25+**
+* **Node.js 20+** e NPM
+* **LXD** instalado e inicializado (`lxd init`)
+
+### 1. Setup Inicial e Backend
+```bash
+# 1. Prepare as imagens do LXC/LXD (Opcional, popula o cache local)
+chmod +x preload_full.sh
+./preload_full.sh
+
+# 2. Instale as dependências do Go
+go mod tidy
+
+# 3. Inicie o Control Plane (Backend)
+go run main.go
+```
+*O Backend iniciará na porta `8500`.*
+
+### 2. Setup do Frontend
+Em um novo terminal:
+```bash
+cd frontend
+
+# 1. Instale as dependências
+npm install
+
+# 2. Inicie o servidor de desenvolvimento
+npm run dev
+```
+*O Dashboard estará acessível em `http://localhost:3000`.*
 
 ---
 
@@ -82,12 +119,6 @@ O coração do Axion é um motor de Jobs resiliente:
 1.  **Estados:** `PENDING` -> `IN_PROGRESS` -> `COMPLETED` / `FAILED`.
 2.  **Resiliência:** Se o servidor reiniciar, jobs travados são recuperados automaticamente.
 3.  **Cron Scheduler:** Agendamento de tarefas recorrentes (ex: Snapshots diários).
-
----
-
-## 📸 Screenshots
-
-*(Espaço reservado para as imagens do Dashboard, Terminal e Wizard)*
 
 ---
 
