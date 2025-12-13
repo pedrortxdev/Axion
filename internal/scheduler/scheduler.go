@@ -1,186 +1,106 @@
 package scheduler
 
 import (
-	"fmt"
+	"database/sql"
 	"log"
-	"sync"
+	"sort"
+	"strings"
 	"time"
-
 	"aexon/internal/db"
+	"aexon/internal/provider/lxc"
 	"aexon/internal/types"
-	"aexon/internal/worker"
-
-	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
+	"github.com/canonical/lxd/shared/api"
 )
 
-type Schedule struct {
-	ID        string        `json:"id"`
-	CronExpr  string        `json:"cron_expr"`
-	Type      types.JobType `json:"type"`
-	Target    string        `json:"target"`
-	Payload   string        `json:"payload"`
-	CreatedAt time.Time     `json:"created_at"`
+type BackupScheduler struct {
+	cron      *cron.Cron
+	db        *sql.DB
+	lxcClient *lxc.InstanceService
 }
 
-type Service struct {
-	cron    *cron.Cron
-	entries map[string]cron.EntryID
-	mu      sync.Mutex
+func NewBackupScheduler(db *sql.DB, lxcClient *lxc.InstanceService) *BackupScheduler {
+	return &BackupScheduler{
+		cron:      cron.New(),
+		db:        db,
+		lxcClient: lxcClient,
+	}
 }
 
-// Init inicializa o serviço de scheduler, criando a tabela se necessário e carregando agendamentos.
-func Init() (*Service, error) {
-	// Create table
-	query := `
-	CREATE TABLE IF NOT EXISTS schedules (
-		id TEXT PRIMARY KEY,
-		cron_expr TEXT NOT NULL,
-		task_type TEXT NOT NULL,
-		target TEXT NOT NULL,
-		payload TEXT NOT NULL,
-		created_at DATETIME NOT NULL DEFAULT (datetime('now'))
-	);`
-	if _, err := db.DB.Exec(query); err != nil {
-		return nil, fmt.Errorf("erro criando tabela schedules: %w", err)
+func (s *BackupScheduler) Start() {
+	s.cron.Start()
+}
+
+func (s *BackupScheduler) Stop() {
+	s.cron.Stop()
+}
+
+func (s *BackupScheduler) SyncJobs() {
+	log.Println("Syncing backup jobs...")
+	s.cron.Stop()
+	for _, entry := range s.cron.Entries() {
+		s.cron.Remove(entry.ID)
 	}
 
-	svc := &Service{
-		cron:    cron.New(),
-		entries: make(map[string]cron.EntryID),
-	}
-
-	// Load existing schedules
-	rows, err := db.DB.Query("SELECT id, cron_expr, task_type, target, payload, created_at FROM schedules")
+	instances, err := db.ListInstances()
 	if err != nil {
-		return nil, fmt.Errorf("erro carregando schedules: %w", err)
-	}
-	defer rows.Close()
-
-	count := 0
-	for rows.Next() {
-		var s Schedule
-		if err := rows.Scan(&s.ID, &s.CronExpr, &s.Type, &s.Target, &s.Payload, &s.CreatedAt); err != nil {
-			log.Printf("[Scheduler] Erro lendo schedule: %v", err)
-			continue
-		}
-		if err := svc.addToCron(&s); err != nil {
-			log.Printf("[Scheduler] Erro adicionando schedule %s ao cron: %v", s.ID, err)
-		} else {
-			count++
-		}
+		log.Printf("Error listing instances for backup scheduling: %v", err)
+		return
 	}
 
-	svc.cron.Start()
-	log.Printf("[Scheduler] Iniciado com %d agendamentos carregados", count)
-	return svc, nil
+	for _, instance := range instances {
+		if instance.BackupEnabled {
+			s.AddInstanceJob(instance)
+		}
+	}
+	s.cron.Start()
 }
 
-func (s *Service) addToCron(sched *Schedule) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Wrap the execution logic
-	entryID, err := s.cron.AddFunc(sched.CronExpr, func() {
-		jobID := uuid.New().String()
-		log.Printf("[Scheduler] Disparando job agendado %s (Schedule: %s)", jobID, sched.ID)
-
-		job := &db.Job{
-			ID:          jobID,
-			Type:        sched.Type,
-			Target:      sched.Target,
-			Payload:     sched.Payload,
-			RequestedBy: func() *string { s := "scheduler"; return &s }(),
-		}
-
-		if err := db.CreateJob(job); err != nil {
-			log.Printf("[Scheduler] Erro criando job %s: %v", jobID, err)
+func (s *BackupScheduler) AddInstanceJob(instance types.Instance) {
+	log.Printf("Scheduling backup for instance %s with schedule %s", instance.Name, instance.BackupSchedule)
+	_, err := s.cron.AddFunc(instance.BackupSchedule, func() {
+		log.Printf("Running backup for instance %s", instance.Name)
+		snapshotName := "auto-backup-" + time.Now().UTC().Format("2006-01-02-15-04-05")
+		if err := s.lxcClient.CreateSnapshot(instance.Name, snapshotName); err != nil {
+			log.Printf("Error creating snapshot for instance %s: %v", instance.Name, err)
 			return
 		}
-		worker.DispatchJob(jobID)
+
+		snapshots, err := s.lxcClient.ListSnapshots(instance.Name)
+		if err != nil {
+			log.Printf("Error listing snapshots for instance %s: %v", instance.Name, err)
+			return
+		}
+
+		var autoBackups []api.InstanceSnapshot
+		for _, snap := range snapshots {
+			if strings.HasPrefix(snap.Name, "auto-backup-") {
+				autoBackups = append(autoBackups, snap)
+			}
+		}
+
+		if len(autoBackups) > instance.BackupRetention {
+			sort.Slice(autoBackups, func(i, j int) bool {
+				return autoBackups[i].CreatedAt.Before(autoBackups[j].CreatedAt)
+			})
+
+			for i := 0; i < len(autoBackups)-instance.BackupRetention; i++ {
+				log.Printf("Deleting old backup %s for instance %s", autoBackups[i].Name, instance.Name)
+				if err := s.lxcClient.DeleteSnapshot(instance.Name, autoBackups[i].Name); err != nil {
+					log.Printf("Error deleting snapshot %s for instance %s: %v", autoBackups[i].Name, instance.Name, err)
+				}
+			}
+		}
 	})
-
 	if err != nil {
-		return err
+		log.Printf("Error scheduling backup for instance %s: %v", instance.Name, err)
 	}
-
-	s.entries[sched.ID] = entryID
-	return nil
 }
 
-func (s *Service) AddSchedule(cronExpr string, taskType types.JobType, target, payload string) (*Schedule, error) {
-	// Validate cron expression
-	if _, err := cron.ParseStandard(cronExpr); err != nil {
-		return nil, fmt.Errorf("expressão cron inválida: %w", err)
+func (s *BackupScheduler) ReloadInstance(name string) {
+	log.Printf("Reloading backup job for instance %s", name)
+	for _, entry := range s.cron.Entries() {
+		s.cron.Remove(entry.ID)
 	}
-
-	id := uuid.New().String()
-	sched := &Schedule{
-		ID:        id,
-		CronExpr:  cronExpr,
-		Type:      taskType,
-		Target:    target,
-		Payload:   payload,
-		CreatedAt: time.Now(),
-	}
-
-	query := `INSERT INTO schedules (id, cron_expr, task_type, target, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)`
-	_, err := db.DB.Exec(query, sched.ID, sched.CronExpr, sched.Type, sched.Target, sched.Payload, sched.CreatedAt)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := s.addToCron(sched); err != nil {
-		// Rollback DB if cron add fails
-		db.DB.Exec("DELETE FROM schedules WHERE id = ?", sched.ID)
-		return nil, fmt.Errorf("erro registrando no cron: %w", err)
-	}
-
-	return sched, nil
-}
-
-func (s *Service) RemoveSchedule(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	entryID, exists := s.entries[id]
-	if !exists {
-		// Check if it exists in DB but was missed in memory (shouldn't happen but for safety)
-		var dbID string
-		err := db.DB.QueryRow("SELECT id FROM schedules WHERE id = ?", id).Scan(&dbID)
-		if err == nil {
-			// Exist in DB, remove from DB only
-			_, _ = db.DB.Exec("DELETE FROM schedules WHERE id = ?", id)
-			return nil
-		}
-		return fmt.Errorf("agendamento não encontrado")
-	}
-
-	// Remove from DB
-	if _, err := db.DB.Exec("DELETE FROM schedules WHERE id = ?", id); err != nil {
-		return err
-	}
-
-	// Remove from Cron
-	s.cron.Remove(entryID)
-	delete(s.entries, id)
-	return nil
-}
-
-func (s *Service) ListSchedules() ([]Schedule, error) {
-	rows, err := db.DB.Query("SELECT id, cron_expr, task_type, target, payload, created_at FROM schedules ORDER BY created_at DESC")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var schedules []Schedule
-	for rows.Next() {
-		var s Schedule
-		if err := rows.Scan(&s.ID, &s.CronExpr, &s.Type, &s.Target, &s.Payload, &s.CreatedAt); err != nil {
-			return nil, err
-		}
-		schedules = append(schedules, s)
-	}
-	return schedules, nil
+	s.SyncJobs()
 }

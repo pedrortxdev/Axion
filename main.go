@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"aexon/internal/api"
 	"aexon/internal/auth"
 	"aexon/internal/db"
+	"aexon/internal/monitor"
 	"aexon/internal/provider/lxc"
 	"aexon/internal/scheduler"
 	"aexon/internal/types"
@@ -33,13 +35,6 @@ type InstanceActionRequest struct {
 type InstanceLimitsRequest struct {
 	Memory string `json:"memory"`
 	CPU    string `json:"cpu"`
-}
-
-type CreateScheduleRequest struct {
-	Cron    string        `json:"cron" binding:"required"`
-	Type    types.JobType `json:"type" binding:"required"`
-	Target  string        `json:"target" binding:"required"`
-	Payload string        `json:"payload" binding:"required"`
 }
 
 type CreateInstanceRequest struct {
@@ -75,13 +70,16 @@ func main() {
 	}
 	log.Println("Conexão com LXD estabelecida.")
 
+	// Run sync and start collectors
+	scheduler.RunStartupSync(db.DB, lxcClient)
+	go monitor.StartHistoricalCollector(db.DB, lxcClient)
+
 	worker.Init(2, lxcClient)
 	api.InitBroadcaster()
 
-	schedulerSvc, err := scheduler.Init()
-	if err != nil {
-		log.Printf("Erro ao inicializar Scheduler: %v", err)
-	}
+	backupScheduler := scheduler.NewBackupScheduler(db.DB, lxcClient)
+	backupScheduler.Start()
+	backupScheduler.SyncJobs()
 
 	r := gin.Default()
 
@@ -102,8 +100,23 @@ func main() {
 	protected.Use(auth.AuthMiddleware())
 	{
 		// Instances
+		protected.GET("/instances/:name", func(c *gin.Context) {
+			name := c.Param("name")
+			instance, err := db.GetInstanceWithBackupInfo(name)
+			if err != nil {
+				if err == sql.ErrNoRows {
+					c.JSON(404, gin.H{"error": "Instance not found"})
+					return
+				}
+				log.Printf("Error getting instance %s: %v", name, err)
+				c.JSON(500, gin.H{"error": "Failed to get instance"})
+				return
+			}
+			c.JSON(200, instance)
+		})
+
 		protected.GET("/instances", func(c *gin.Context) {
-			instances, err := lxcClient.ListInstances()
+			instances, err := db.ListInstances()
 			if err != nil {
 				log.Printf("Erro ao processar ListInstances: %v", err)
 				c.JSON(500, gin.H{"error": "Falha ao obter métricas"})
@@ -132,6 +145,22 @@ func main() {
 				return
 			}
 
+			instance := &types.Instance{
+				Name:            req.Name,
+				Image:           req.Image,
+				Limits:          req.Limits,
+				UserData:        req.UserData,
+				Type:            req.Type,
+				BackupSchedule:  "@daily",
+				BackupRetention: 7,
+				BackupEnabled:   false,
+			}
+
+			if err := db.CreateInstance(instance); err != nil {
+				c.JSON(500, gin.H{"error": err.Error()})
+				return
+			}
+
 			jobID := uuid.New().String()
 			payloadBytes, _ := json.Marshal(req)
 			job := &db.Job{ID: jobID, Type: types.JobTypeCreateInstance, Target: req.Name, Payload: string(payloadBytes)}
@@ -145,6 +174,12 @@ func main() {
 
 		protected.DELETE("/instances/:name", func(c *gin.Context) {
 			name := c.Param("name")
+
+			if err := db.DeleteInstance(name); err != nil {
+				c.JSON(500, gin.H{"error": err.Error()})
+				return
+			}
+
 			jobID := uuid.New().String()
 			job := &db.Job{ID: jobID, Type: types.JobTypeDeleteInstance, Target: name, Payload: "{}"}
 			if err := db.CreateJob(job); err != nil {
@@ -171,6 +206,25 @@ func main() {
 			}
 			worker.DispatchJob(jobID)
 			c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+		})
+
+		protected.POST("/instances/:name/backups/config", func(c *gin.Context) {
+			name := c.Param("name")
+			var req struct {
+				Enabled   bool   `json:"enabled"`
+				Schedule  string `json:"schedule"`
+				Retention int    `json:"retention"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(400, gin.H{"error": "Invalid JSON: " + err.Error()})
+				return
+			}
+			if err := db.UpdateInstanceBackupConfig(name, req.Enabled, req.Schedule, req.Retention); err != nil {
+				c.JSON(500, gin.H{"error": err.Error()})
+				return
+			}
+			backupScheduler.ReloadInstance(name)
+			c.JSON(200, gin.H{"status": "updated"})
 		})
 
 		protected.POST("/instances/:name/limits", func(c *gin.Context) {
@@ -383,51 +437,6 @@ func main() {
 			c.JSON(200, gin.H{"status": "deleted"})
 		})
 
-		// Schedules
-		protected.GET("/schedules", func(c *gin.Context) {
-			if schedulerSvc == nil {
-				c.JSON(500, gin.H{"error": "Scheduler unavailable"})
-				return
-			}
-			list, err := schedulerSvc.ListSchedules()
-			if err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			c.JSON(200, list)
-		})
-
-		protected.POST("/schedules", func(c *gin.Context) {
-			if schedulerSvc == nil {
-				c.JSON(500, gin.H{"error": "Scheduler unavailable"})
-				return
-			}
-			var req CreateScheduleRequest
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(400, gin.H{"error": "Invalid JSON: " + err.Error()})
-				return
-			}
-			sched, err := schedulerSvc.AddSchedule(req.Cron, req.Type, req.Target, req.Payload)
-			if err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			c.JSON(201, sched)
-		})
-
-		protected.DELETE("/schedules/:id", func(c *gin.Context) {
-			if schedulerSvc == nil {
-				c.JSON(500, gin.H{"error": "Scheduler unavailable"})
-				return
-			}
-			id := c.Param("id")
-			if err := schedulerSvc.RemoveSchedule(id); err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			c.JSON(200, gin.H{"status": "deleted"})
-		})
-
 		protected.GET("/jobs", func(c *gin.Context) {
 			jobs, err := db.ListRecentJobs(50)
 			if err != nil {
@@ -446,7 +455,46 @@ func main() {
 			c.JSON(200, job)
 		})
 		protected.GET("/ws/telemetry", func(c *gin.Context) {
-			api.StreamTelemetry(c, lxcClient)
+			api.StreamTelemetry(c, lxcClient, func(metrics []lxc.InstanceMetric) {
+				for _, m := range metrics {
+					// Convert lxc.InstanceMetric to db.Metric
+					dbMetric := &db.Metric{
+						InstanceName: m.Name,
+						CPUPercent:   float64(m.CPUUsageSeconds), // This might need adjustment depending on how you calculate percentage
+						MemoryUsage:  m.MemoryUsageBytes,
+						DiskUsage:    m.DiskUsageBytes,
+					}
+					if err := db.InsertMetric(dbMetric); err != nil {
+						log.Printf("Error inserting metric for instance %s: %v", m.Name, err)
+					}
+				}
+			})
+		})
+
+		protected.GET("/instances/:name/metrics/history", func(c *gin.Context) {
+			name := c.Param("name")
+			rangeParam := c.DefaultQuery("range", "1h")
+
+			intervalMap := map[string]string{
+				"1h":  "1 hour",
+				"24h": "24 hours",
+				"7d":  "7 days",
+			}
+
+			interval, ok := intervalMap[rangeParam]
+			if !ok {
+				c.JSON(400, gin.H{"error": "Invalid range. Valid ranges are 1h, 24h, 7d"})
+				return
+			}
+
+			metrics, err := db.GetInstanceMetrics(name, interval)
+			if err != nil {
+				log.Printf("Error fetching metrics history for %s: %v", name, err)
+				c.JSON(500, gin.H{"error": "Failed to fetch metrics history"})
+				return
+			}
+
+			c.JSON(200, metrics)
 		})
 
 		// Instance logs endpoint

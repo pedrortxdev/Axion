@@ -43,6 +43,14 @@ export interface InstanceDevices {
   };
 }
 
+export interface InstanceBackupInfo {
+  enabled: boolean;
+  schedule: string;
+  next_run?: string; // ISO date string
+  last_run?: string; // ISO date string
+  last_status?: string; // "completed", "failed", etc.
+}
+
 export interface InstanceMetric {
   location?: string;
   name: string;
@@ -50,8 +58,13 @@ export interface InstanceMetric {
   status: string;
   memory_usage_bytes: number;
   cpu_usage_seconds: number;
+  disk_usage_bytes: number;
+  network_rx_bytes: number;
+  network_tx_bytes: number;
   config: InstanceConfig;
-  devices?: InstanceDevices; // Adicionado
+  devices?: InstanceDevices;
+  state?: any; // To include full instance state from API, including network info
+  backup_info?: InstanceBackupInfo; // Added for backup observability
 }
 
 export interface WSEvent {

@@ -23,14 +23,17 @@ type InstanceService struct {
 }
 
 type InstanceMetric struct {
-	Location         string                       `json:"location"`
-	Name             string                       `json:"name"`
-	Type             string                       `json:"type"`
-	Status           string                       `json:"status"`
-	MemoryUsageBytes int64                        `json:"memory_usage_bytes"`
-	CPUUsageSeconds  int64                        `json:"cpu_usage_seconds"`
-	Config           map[string]string            `json:"config"`
-	Devices          map[string]map[string]string `json:"devices"`
+	Location          string                       `json:"location"`
+	Name              string                       `json:"name"`
+	Type              string                       `json:"type"`
+	Status            string                       `json:"status"`
+	MemoryUsageBytes  int64                        `json:"memory_usage_bytes"`
+	CPUUsageSeconds   int64                        `json:"cpu_usage_seconds"`
+	DiskUsageBytes    int64                        `json:"disk_usage_bytes"`
+	NetworkUsageRxBytes int64                      `json:"network_rx_bytes"`
+	NetworkUsageTxBytes int64                      `json:"network_tx_bytes"`
+	Config            map[string]string            `json:"config"`
+	Devices           map[string]map[string]string `json:"devices"`
 }
 
 const (
@@ -222,12 +225,22 @@ func (s *InstanceService) ListInstances() ([]InstanceMetric, error) {
 
 		cpuSeconds := int64(0)
 		memBytes := int64(0)
+		diskBytes := int64(0)
+		netRxBytes := int64(0)
+		netTxBytes := int64(0)
 
 		if err != nil {
 			log.Printf("Aviso: não foi possível obter estado para %s: %v", inst.Name, err)
 		} else {
 			cpuSeconds = state.CPU.Usage / 1_000_000_000
 			memBytes = state.Memory.Usage
+			if rootDisk, ok := state.Disk["root"]; ok {
+				diskBytes = rootDisk.Usage
+			}
+			if eth0, ok := state.Network["eth0"]; ok {
+				netRxBytes = int64(eth0.Counters.BytesReceived)
+				netTxBytes = int64(eth0.Counters.BytesSent)
+			}
 		}
 
 		metrics = append(metrics, InstanceMetric{
@@ -237,6 +250,9 @@ func (s *InstanceService) ListInstances() ([]InstanceMetric, error) {
 			Status:           inst.Status,
 			MemoryUsageBytes: memBytes,
 			CPUUsageSeconds:  cpuSeconds,
+			DiskUsageBytes:   diskBytes,
+			NetworkUsageRxBytes: netRxBytes,
+			NetworkUsageTxBytes: netTxBytes,
 			Config:           inst.Config,
 			Devices:          inst.Devices,
 		})
@@ -334,94 +350,98 @@ func (s *InstanceService) UpdateInstanceLimits(name string, memoryLimit string, 
 
 // CreateInstance cria um novo container ou VM a partir de uma imagem LOCAL com suporte a Cloud-Init.
 func (s *InstanceService) CreateInstance(name string, imageAlias string, instanceType string, limits map[string]string, userData string) error {
-    // 1. Lock check
-    if _, busy := s.locks.LoadOrStore(name, true); busy {
-        return fmt.Errorf("LOCKED: %s está ocupado", name)
-    }
-    defer s.locks.Delete(name)
+	// 1. Lock check
+	if _, busy := s.locks.LoadOrStore(name, true); busy {
+		return fmt.Errorf("LOCKED: %s está ocupado", name)
+	}
+	defer s.locks.Delete(name)
 
-    // 2. Ajuste de Alias (VM vs Container)
-    finalAlias := imageAlias
-    if instanceType == "virtual-machine" && !strings.HasSuffix(imageAlias, "-vm") {
-        finalAlias = imageAlias + "-vm"
-    }
+	// 2. Ajuste de Alias (VM vs Container)
+	finalAlias := imageAlias
+	if instanceType == "virtual-machine" && !strings.HasSuffix(imageAlias, "-vm") {
+		finalAlias = imageAlias + "-vm"
+	}
 
-    // Validação: Verificar se a imagem existe ANTES de tentar
-    _, _, err := s.server.GetImageAlias(finalAlias)
-    if err != nil {
-        return fmt.Errorf("IMAGEM NÃO ENCONTRADA: O alias '%s' não existe no LXD. Rode o script de preload.", finalAlias)
-    }
+	// Validação: Verificar se a imagem existe ANTES de tentar
+	_, _, err := s.server.GetImageAlias(finalAlias)
+	if err != nil {
+		return fmt.Errorf("IMAGEM NÃO ENCONTRADA: O alias '%s' não existe no LXD. Rode o script de preload.", finalAlias)
+	}
 
-    // 3. Configuração
-    config := make(map[string]string)
-    for k, v := range limits {
-        config[k] = v
-    }
+	// 3. Configuração
+	config := make(map[string]string)
+	for k, v := range limits {
+		config[k] = v
+	}
 
-    if instanceType == "virtual-machine" {
-        config["security.secureboot"] = "false"
-        // config["agent.enabled"] = "true" // REMOVIDO: Causa erro em LXD recente
-    }
+	if instanceType == "virtual-machine" {
+		config["security.secureboot"] = "false"
+		// config["agent.enabled"] = "true" // REMOVIDO: Causa erro em LXD recente
+	}
 
-    if userData != "" {
-        config["user.user-data"] = userData
-        // FIX: Configuração de rede universal (funciona para eth0 e enp5s0)
-        config["cloud-init.network-config"] = "version: 2\nethernets:\n  all-interfaces:\n    match:\n      name: \"e*\"\n    dhcp4: true"
-    }
+	if userData != "" {
+		config["user.user-data"] = userData
+		// FIX: Configuração de rede universal (funciona para eth0 e enp5s0)
+		config["cloud-init.network-config"] = "version: 2\nethernets:\n  all-interfaces:\n    match:\n      name: \"e*\"\n    dhcp4: true"
+	}
 
-    req := api.InstancesPost{
-        Name: name,
-        Type: api.InstanceType(instanceType), // Vital para VM
-        Source: api.InstanceSource{
-            Type:  "image",
-            Alias: finalAlias,
-        },
-        InstancePut: api.InstancePut{
-            Config:   config,
-            Profiles: []string{"default"},
-        },
-    }
+	req := api.InstancesPost{
+		Name: name,
+		Type: api.InstanceType(instanceType), // Vital para VM
+		Source: api.InstanceSource{
+			Type:  "image",
+			Alias: finalAlias,
+		},
+		InstancePut: api.InstancePut{
+			Config:   config,
+			Devices: map[string]map[string]string{
+				"root": {"type": "disk", "path": "/", "pool": "axion"},
+				"eth0": {"type": "nic", "name": "eth0", "network": "axion-br"},
+			},
+			Profiles: []string{"default"},
+		},
+	}
 
-    log.Printf("[Create] Iniciando criação de %s (%s) com imagem '%s'...", name, instanceType, finalAlias)
+	log.Printf("[Create] Iniciando criação de %s (%s) com imagem '%s'...", name, instanceType, finalAlias)
 
-    // 4. Execução Assíncrona
-    op, err := s.server.CreateInstance(req)
-    if err != nil {
-        return fmt.Errorf("LXD recusou a request: %w", err)
-    }
+	// 4. Execução Assíncrona
+	op, err := s.server.CreateInstance(req)
+	if err != nil {
+		return fmt.Errorf("LXD recusou a request: %w", err)
+	}
 
-    // 5. Esperar a Operação (Aqui que a VM demora 10s+)
-    log.Printf("[Create] Aguardando operação do LXD...")
-    if err := op.Wait(); err != nil {
-        return fmt.Errorf("LXD falhou durante a criação: %w", err)
-    }
+	// 5. Esperar a Operação (Aqui que a VM demora 10s+)
+	log.Printf("[Create] Aguardando operação do LXD...")
+	if err := op.Wait(); err != nil {
+		return fmt.Errorf("LXD falhou durante a criação: %w", err)
+	}
 
-    	// 6. O TIRA-TEIMA (Double Check)
-    	// Verifica se a instância realmente existe no banco do LXD
-    	_, _, err = s.server.GetInstance(name)
-    	if err != nil {
-    		return fmt.Errorf("ERRO FANTASMA: LXD disse sucesso, mas a instância '%s' não foi encontrada: %w", name, err)
-    	}
-    
-    	// 7. Auto-Start: Iniciar a instância imediatamente
-    	log.Printf("[Create] Iniciando boot de %s...", name)
-    	reqState := api.InstanceStatePut{
-    		Action:  "start",
-    		Timeout: -1,
-    	}
-    
-    	opStart, err := s.server.UpdateInstanceState(name, reqState, "")
-    	if err != nil {
-    		return fmt.Errorf("falha ao solicitar start pós-criação: %w", err)
-    	}
-    
-    	if err := opStart.Wait(); err != nil {
-    		return fmt.Errorf("falha ao iniciar instância: %w", err)
-    	}
-    
-    	log.Printf("[Create] Sucesso confirmado para %s", name)
-    	return nil
-    }
+	// 6. O TIRA-TEIMA (Double Check)
+	// Verifica se a instância realmente existe no banco do LXD
+	_, _, err = s.server.GetInstance(name)
+	if err != nil {
+		return fmt.Errorf("ERRO FANTASMA: LXD disse sucesso, mas a instância '%s' não foi encontrada: %w", name, err)
+	}
+
+	// 7. Auto-Start: Iniciar a instância imediatamente
+	log.Printf("[Create] Iniciando boot de %s...", name)
+	reqState := api.InstanceStatePut{
+		Action:  "start",
+		Timeout: -1,
+	}
+
+	opStart, err := s.server.UpdateInstanceState(name, reqState, "")
+	if err != nil {
+		return fmt.Errorf("falha ao solicitar start pós-criação: %w", err)
+	}
+
+	if err := opStart.Wait(); err != nil {
+		return fmt.Errorf("falha ao iniciar instância: %w", err)
+	}
+
+	log.Printf("[Create] Sucesso confirmado para %s", name)
+	return nil
+}
 func (s *InstanceService) DeleteInstance(name string) error {
 	if _, busy := s.locks.LoadOrStore(name, true); busy {
 		return fmt.Errorf("LOCKED: container '%s' já está sendo operado", name)
@@ -604,11 +624,52 @@ func (s *InstanceService) AddProxyDevice(instanceName string, hostPort int, cont
 		inst.Devices = make(map[string]map[string]string)
 	}
 
-	inst.Devices[deviceName] = map[string]string{
-		"type":    "proxy",
-		"listen":  fmt.Sprintf("%s:0.0.0.0:%d", protocol, hostPort),
-		"connect": fmt.Sprintf("%s:127.0.0.1:%d", protocol, containerPort),
-		"bind":    "host",
+	// Hotfix: Diferenciar proxy para VM e Container
+	if inst.Type == "virtual-machine" {
+		// Modo NAT para VMs requer o IP da instância
+		state, _, err := s.server.GetInstanceState(instanceName)
+		if err != nil {
+			return fmt.Errorf("falha ao obter estado da VM para encontrar IP: %w", err)
+		}
+
+		var vmIP string
+		// Procurar o IP em todas as interfaces de rede
+		for _, net := range state.Network {
+			for _, addr := range net.Addresses {
+				if addr.Family == "inet" && addr.Address != "127.0.0.1" {
+					vmIP = addr.Address
+					break
+				}
+			}
+			if vmIP != "" {
+				break
+			}
+		}
+
+		if vmIP == "" {
+			return fmt.Errorf("não foi possível encontrar o endereço IPv4 da VM '%s'", instanceName)
+		}
+
+		// Adiciona o device de proxy
+		inst.Devices[deviceName] = map[string]string{
+			"type":    "proxy",
+			"listen":  fmt.Sprintf("%s:10.0.10.1:%d", protocol, hostPort),
+			"connect": fmt.Sprintf("%s:%s:%d", protocol, vmIP, containerPort),
+			"nat":     "true",
+		}
+
+		// Garante que o IP da VM seja considerado estático pelo LXD
+		if eth0, ok := inst.Devices["eth0"]; ok {
+			eth0["ipv4.address"] = vmIP
+		}
+	} else {
+		// Modo BIND para Containers (requer `bind=host` explícito)
+		inst.Devices[deviceName] = map[string]string{
+			"type":    "proxy",
+			"listen":  fmt.Sprintf("%s:0.0.0.0:%d", protocol, hostPort),
+			"connect": fmt.Sprintf("%s:127.0.0.1:%d", protocol, containerPort),
+			"bind":    "host",
+		}
 	}
 
 	req := api.InstancePut{

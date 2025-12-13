@@ -22,7 +22,7 @@ var upgrader = websocket.Upgrader{
 }
 
 // StreamTelemetry lida com a conexão WebSocket.
-func StreamTelemetry(c *gin.Context, instanceService *lxc.InstanceService) {
+func StreamTelemetry(c *gin.Context, instanceService *lxc.InstanceService, metricProcessor func([]lxc.InstanceMetric)) {
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Printf("Falha no upgrade WebSocket: %v", err)
@@ -54,6 +54,11 @@ func StreamTelemetry(c *gin.Context, instanceService *lxc.InstanceService) {
 				if err != nil {
 					log.Printf("Erro ao coletar métricas: %v", err)
 					continue
+				}
+
+				// Process metrics
+				if metricProcessor != nil {
+					metricProcessor(metrics)
 				}
 
 				// Tenta enviar. Se o contexto for cancelado ou buffer cheio, desiste.

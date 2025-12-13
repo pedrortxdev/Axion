@@ -57,7 +57,7 @@ export default function NetworksPage() {
       }
 
       const data = await response.json();
-      setNetworks(data);
+      setNetworks(data || []);
     } catch (error) {
       toast.error('Failed to load networks', {
         description: error instanceof Error ? error.message : 'Unknown error'

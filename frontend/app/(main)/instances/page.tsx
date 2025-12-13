@@ -2,9 +2,10 @@
 
 import React, { useEffect, useState, useRef } from 'react';
 import { AreaChart, Area, ResponsiveContainer, Tooltip } from 'recharts';
-import { Server, Cpu, Zap, Play, Square, RefreshCw, Loader2, Settings, Save, HardDrive, Network, FolderOpen, MoreVertical, X, SquareTerminal, Trash2, Box, Monitor, Search } from 'lucide-react';
+import { Server, Cpu, Zap, Play, Square, RefreshCw, Loader2, Settings, Save, HardDrive, Network, FolderOpen, MoreVertical, X, SquareTerminal, Trash2, Box, Monitor, Search, ShieldCheck } from 'lucide-react';
 import { toast, Toaster } from 'sonner';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import ActivityDrawer from '@/components/ActivityDrawer';
 import CreateInstanceModal from '@/components/CreateInstanceModal';
 import SnapshotDrawer from '@/components/SnapshotDrawer';
@@ -13,6 +14,7 @@ import FileExplorerDrawer from '@/components/FileExplorerDrawer';
 import WebTerminal from '@/components/WebTerminal';
 import HostStatsCard from '@/components/HostStatsCard';
 import ClusterStatus from '@/components/ClusterStatus';
+import BackupPolicyModal from '@/components/BackupPolicyModal';
 import { Job, InstanceMetric } from '@/types';
 
 // --- Types Local ---
@@ -77,6 +79,7 @@ export default function InstancesPage() {
   const [networkInstance, setNetworkInstance] = useState<string | null>(null);
   const [fileInstance, setFileInstance] = useState<string | null>(null);
   const [terminalInstance, setTerminalInstance] = useState<string | null>(null);
+  const [backupPolicyInstance, setBackupPolicyInstance] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState<Record<string, boolean>>({});
   const [resourceInputs, setResourceInputs] = useState<Record<string, ResourceState>>({});
   
@@ -406,6 +409,7 @@ export default function InstancesPage() {
       <NetworkDrawer isOpen={!!networkInstance} onClose={() => setNetworkInstance(null)} instance={metrics.find(m => m.name === networkInstance) || null} />
       <FileExplorerDrawer isOpen={!!fileInstance} onClose={() => setFileInstance(null)} instanceName={fileInstance} />
       {terminalInstance && <WebTerminal instanceName={terminalInstance} onClose={() => setTerminalInstance(null)} />}
+      <BackupPolicyModal isOpen={!!backupPolicyInstance} onClose={() => setBackupPolicyInstance(null)} instanceName={backupPolicyInstance} token={token} />
 
       <header className="mb-8">
         <div className="flex justify-between items-center mb-6">
@@ -488,7 +492,9 @@ export default function InstancesPage() {
                   </div>
                   <div>
                     <div className="flex items-center gap-2">
-                      <h3 className="text-sm font-semibold text-zinc-200 tracking-tight">{inst.name}</h3>
+                      <Link href={`/instances/${inst.name}`} className="font-bold text-sm text-zinc-200 tracking-tight hover:underline decoration-zinc-500 underline-offset-4">
+                        {inst.name}
+                      </Link>
                       {inst.location && inst.location !== 'none' && inst.location.trim() !== '' && (
                         <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-zinc-800 border border-zinc-700 rounded text-xs text-zinc-300 font-medium">
                           <Server size={10} strokeWidth={1.5} />
@@ -546,6 +552,9 @@ export default function InstancesPage() {
                               </button>
                               <button onClick={() => { setSnapshotInstance(inst.name); setMenuOpen(null); }} className="w-full text-left px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 flex items-center gap-2">
                                   <HardDrive size={14} /> Backups
+                              </button>
+                              <button onClick={() => { setBackupPolicyInstance(inst.name); setMenuOpen(null); }} className="w-full text-left px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 flex items-center gap-2">
+                                  <ShieldCheck size={14} /> Backup Settings
                               </button>
                               <div className="h-px bg-zinc-800 my-1"></div>
                               <button onClick={() => { setShowSettings(prev => ({ ...prev, [inst.name]: true })); setMenuOpen(null); }} className="w-full text-left px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 flex items-center gap-2">
