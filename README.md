@@ -128,9 +128,10 @@ Antes de começar, certifique-se de ter os seguintes componentes instalados:
 
 #### Instalação do LXD e Inicialização
 ```bash
-# Instale o LXD (Ubuntu/Debian)
+# Instale o snapd e o LXD (Ubuntu/Debian)
 sudo apt update
-sudo apt install lxd lxd-client
+sudo apt install snapd -y
+sudo snap install lxd
 
 # Inicialize o LXD (responda às perguntas conforme sua infraestrutura)
 sudo lxd init

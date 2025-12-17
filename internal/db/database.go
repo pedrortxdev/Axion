@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"aexon/internal/provider/lxc"
@@ -55,7 +56,19 @@ func Init(dbPath string) error {
 	}
 
 	if err = DB.Ping(); err != nil {
-		return fmt.Errorf("erro ao conectar ao banco de dados: %w", err)
+		// Check for specific errors that suggest the DB needs to be bootstrapped.
+		if strings.Contains(err.Error(), "password authentication failed") || strings.Contains(err.Error(), "database \"axion_db\" does not exist") {
+			log.Println("Database connection failed. Attempting to run bootstrap setup...")
+			EnsureDBSetup()
+
+			// Retry connection after bootstrap
+			log.Println("Retrying database connection...")
+			if err = DB.Ping(); err != nil {
+				return fmt.Errorf("erro ao conectar ao banco de dados após bootstrap: %w", err)
+			}
+		} else {
+			return fmt.Errorf("erro ao conectar ao banco de dados: %w", err)
+		}
 	}
 
 	return createTables()

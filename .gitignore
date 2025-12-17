@@ -30,7 +30,8 @@ node_modules/
 .next/
 out/
 dist/
-
+frontend/node_modules
+frontend/.next
 # Env
 .env
 .env.local

@@ -18,13 +18,11 @@ download_image() {
 # --- CONTAINERS (LXC) ---
 echo "📦 Baixando Containers..."
 download_image "ubuntu:24.04" "ubuntu/24.04" ""
-download_image "ubuntu:22.04" "ubuntu/22.04" ""
 
 # --- VIRTUAL MACHINES (KVM) ---
 echo "🖥️  Baixando VMs (Isso demora mais)..."
 # O parametro --vm diz ao LXD para baixar o disco bootável QCOW2/Raw
 download_image "ubuntu:24.04" "ubuntu/24.04-vm" "--vm"
-download_image "ubuntu:22.04" "ubuntu/22.04-vm" "--vm"
 
 echo "------------------------------------------------"
 echo "✅ Concluído! Lista de Imagens Disponíveis:"
