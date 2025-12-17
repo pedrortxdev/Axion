@@ -185,7 +185,6 @@ export default function BackupPolicyModal({ isOpen, onClose, instance, token }: 
           </button>
           <button
             onClick={handleSave}
-            disabled={!enabled}
             className="flex items-center gap-2 px-5 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-500 rounded-md transition-colors shadow-lg shadow-indigo-900/20 disabled:bg-zinc-700 disabled:text-zinc-400 disabled:cursor-not-allowed"
           >
             <Save size={16} />

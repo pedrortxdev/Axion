@@ -45,7 +45,7 @@ type CreateInstanceRequest struct {
 	UserData   string            `json:"user_data"`   // Opcional: Cloud-Init
 	Type       string            `json:"type"`        // Instance type: "container" or "virtual-machine"
 	TemplateID string            `json:"template_id"` // Opcional: ID do template a ser usado
-	ISOPath    string            `json:"iso_path"`    // Caminho para ISO customizada (opcional)
+	ISOImage   string            `json:"iso_image"`   // Nome do arquivo ISO para boot customizado (opcional)
 }
 
 type SnapshotRequest struct {
@@ -105,7 +105,7 @@ func main() {
 		// Instances
 		protected.GET("/instances/:name", func(c *gin.Context) {
 			name := c.Param("name")
-			instance, err := db.GetInstanceWithBackupInfo(name)
+			instance, err := db.GetInstanceWithHardwareInfo(name, lxcClient)
 			if err != nil {
 				if err == sql.ErrNoRows {
 					c.JSON(404, gin.H{"error": "Instance not found"})
@@ -181,8 +181,8 @@ func main() {
 				}
 			}
 
-			// If ISOPath is provided, validate that the ISO exists
-			if req.ISOPath != "" {
+			// If ISOImage is provided, validate that the ISO exists
+			if req.ISOImage != "" {
 				storageService, err := service.NewStorageService()
 				if err != nil {
 					c.JSON(500, gin.H{"error": "Failed to initialize storage service"})
@@ -190,7 +190,7 @@ func main() {
 				}
 
 				// Validate that the ISO file exists
-				isoPath := storageService.GetISOPath(filepath.Base(req.ISOPath))
+				isoPath := storageService.GetISOPath(req.ISOImage)
 				if _, err := os.Stat(isoPath); os.IsNotExist(err) {
 					c.JSON(400, gin.H{"error": "Specified ISO file does not exist"})
 					return
@@ -569,6 +569,36 @@ func main() {
 			c.JSON(200, metrics)
 		})
 
+		// Current metrics endpoint
+		protected.GET("/instances/:name/metrics", func(c *gin.Context) {
+			name := c.Param("name")
+
+			// Get current metrics for the instance
+			lxdMetrics, err := lxcClient.ListInstances()
+			if err != nil {
+				log.Printf("Error fetching metrics for instance %s: %v", name, err)
+				c.JSON(500, gin.H{"error": "Failed to fetch metrics"})
+				return
+			}
+
+			// Find the specific instance
+			var targetMetric *lxc.InstanceMetric
+			for _, metric := range lxdMetrics {
+				if metric.Name == name {
+					metric := metric // Create a copy of the loop variable
+					targetMetric = &metric
+					break
+				}
+			}
+
+			if targetMetric == nil {
+				c.JSON(404, gin.H{"error": "Instance not found"})
+				return
+			}
+
+			c.JSON(200, targetMetric)
+		})
+
 		// Instance logs endpoint
 		protected.GET("/instances/:name/logs", func(c *gin.Context) {
 			name := c.Param("name")
@@ -648,19 +678,18 @@ func main() {
 				return
 			}
 
-			// Save ISO file using streaming
-			filePath, err := storageService.SaveISOFromReader(filename, file)
+			// Save ISO file using streaming and get info
+			isoInfo, err := storageService.SaveISOWithInfo(filename, file)
 			if err != nil {
 				log.Printf("Error saving ISO file: %v", err)
 				c.JSON(500, gin.H{"error": "Failed to save ISO file", "details": err.Error()})
 				return
 			}
 
-			isoName := filepath.Base(filePath)
 			c.JSON(200, gin.H{
-				"status": "success",
-				"iso_name": isoName,
-				"iso_path": filePath,
+				"filename": isoInfo.Name,
+				"size":     isoInfo.Size,
+				"path":     isoInfo.Path,
 			})
 		})
 
@@ -680,8 +709,24 @@ func main() {
 				return
 			}
 
+			// Get detailed information for each ISO
+			var isoInfos []gin.H
+			for _, isoName := range isos {
+				info, err := storageService.GetISOInfo(isoName)
+				if err != nil {
+					log.Printf("Error getting info for ISO %s: %v", isoName, err)
+					continue
+				}
+
+				isoInfos = append(isoInfos, gin.H{
+					"name": isoName,
+					"size": info.Size(),
+					"path": storageService.GetISOPath(isoName),
+				})
+			}
+
 			c.JSON(200, gin.H{
-				"isos": isos,
+				"isos": isoInfos,
 			})
 		})
 

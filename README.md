@@ -63,6 +63,29 @@ Ao contrário de soluções tradicionais, o Axion foi construído do zero com fo
 - 🔐 **Cluster Mode**: Conexão segura via TLS para múltiplos nós LXD
 - ⚙️ **Scheduler Integrado**: Agendamento de tarefas com expressões Cron e persistência
 - 📝 **File Explorer**: Gerenciador de arquivos integrado com upload/download
+- 💿 **ISO Upload & VM Custom Boot**: Upload de arquivos ISO para instalação personalizada de sistemas operacionais (Windows/Linux)
+
+#### 💿 ISO Upload & VM Custom Boot
+
+O Axion suporta upload de arquivos ISO para criação de VMs com sistemas operacionais personalizados, como Windows ou distribuições Linux que não estejam disponíveis nos repositórios padrão do LXD.
+
+**Funcionalidades principais:**
+- Upload de ISOs via interface web com streaming (arquivos grandes não carregam totalmente na RAM)
+- Armazenamento seguro no diretório `./data/isos/`
+- Criação de VMs vazias configuradas para bootar a partir do ISO
+- Configurações específicas para compatibilidade com Windows (secureboot desabilitado)
+- Aplicação automática de limites mínimos (2 vCPUs, 4GB RAM)
+
+**Endpoints API:**
+- `POST /storage/isos` - Upload de arquivos ISO
+- `GET /storage/isos` - Listagem de ISOs disponíveis
+- Parâmetro `iso_image` no payload de criação de VM para usar ISO como boot
+
+**Recursos técnicos:**
+- Streaming direto para disco sem carregar arquivo completo na memória
+- Dispositivos ISO configurados com alta prioridade de boot
+- Validação de extensão e proteção contra path traversal
+- Integração automática com LXD para configuração de boot ISO
 
 ---
 

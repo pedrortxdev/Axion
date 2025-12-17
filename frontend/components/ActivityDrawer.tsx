@@ -108,7 +108,7 @@ function JobCard({ job }: { job: Job }) {
           </span>
         </div>
         <span className="text-[10px] text-zinc-500 tabular-nums">
-          {job.created_at ? formatDistanceToNow(new Date(job.created_at), { addSuffix: true }) : 'Just now'}
+          {job.created_at ? formatDistanceToNow(new Date(job.created_at + 'Z'), { addSuffix: true }) : 'Just now'}
         </span>
       </div>
       

@@ -9,6 +9,7 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, Area, Area
 
 import { InstanceMetric, Job, MetricHistory } from '@/types';
 import WebTerminal from '@/components/WebTerminal';
+import { InstanceInfoCard } from '@/components/InstanceInfoCard';
 import { formatBytes } from '@/lib/utils'; // Import formatBytes
 
 // Helper to get relative time
@@ -117,6 +118,62 @@ const MetricCard = ({ title, value, subValue, icon, children, timeRange, onTimeR
 );
 
 
+const MetricChartCard = ({ title, value, subValue, icon, children, timeRange, onTimeRangeChange, hasData }: any) => (
+    <div className="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 h-64 flex flex-col">
+        <div className="flex justify-between items-center">
+            <h3 className="font-semibold text-zinc-100 flex items-center gap-2">{icon} {title}</h3>
+            <div className="flex gap-1">
+                {['1H', '24H', '7D'].map(range => (
+                    <button key={range} onClick={() => onTimeRangeChange(range)} className={`px-2 py-0.5 text-xs rounded-md transition-colors ${timeRange === range ? 'bg-zinc-700 text-zinc-100' : 'bg-transparent text-zinc-400 hover:bg-zinc-800'}`}>{range}</button>
+                ))}
+            </div>
+        </div>
+        <div className="mt-3">
+            <span className="text-2xl font-bold text-zinc-100">{value}</span>
+            {subValue && <span className="text-sm text-zinc-400 ml-2">{subValue}</span>}
+        </div>
+        <div className="flex-grow mt-4">
+            {hasData ? children : <div className="flex items-center justify-center h-full text-zinc-500 text-sm">Waiting for metrics...</div>}
+        </div>
+    </div>
+);
+
+const PerformanceMetrics = ({ history, timeRange, onTimeRangeChange, cpuUsage, memPercent, memUsage, memTotal }: any) => {
+    const chartData = history.map((h: MetricHistory) => ({
+        time: new Date(h.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        cpu: h.cpu_usage,
+        memory: h.memory_usage ? h.memory_usage / 1024 : 0, // In MB
+    }));
+
+    return (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <MetricChartCard title="Memory Usage" value={`${memPercent}%`} subValue={`${memUsage} / ${memTotal}`} icon={<MemoryStick size={16}/>} timeRange={timeRange} onTimeRangeChange={onTimeRangeChange} hasData={chartData.length > 0}>
+                <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={chartData} margin={{ top: 5, right: 20, left: -10, bottom: 0 }}>
+                        <Tooltip contentStyle={{ backgroundColor: '#18181b', border: '1px solid #3f3f46', fontSize: '12px' }} labelStyle={{ color: '#a1a1aa' }}/>
+                        <defs><linearGradient id="colorMemory" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#8884d8" stopOpacity={0.4}/><stop offset="95%" stopColor="#8884d8" stopOpacity={0}/></linearGradient></defs>
+                        <Area type="monotone" dataKey="memory" stroke="#8884d8" fillOpacity={1} fill="url(#colorMemory)" strokeWidth={2}/>
+                        <YAxis stroke="#52525b" fontSize={12} unit="MB"/>
+                        <XAxis dataKey="time" stroke="#52525b" fontSize={12} />
+                    </AreaChart>
+                </ResponsiveContainer>
+            </MetricChartCard>
+
+            <MetricChartCard title="CPU Usage" value={`~${cpuUsage}%`} icon={<Cpu size={16}/>} timeRange={timeRange} onTimeRangeChange={onTimeRangeChange} hasData={chartData.length > 0}>
+                <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={chartData} margin={{ top: 5, right: 20, left: -10, bottom: 0 }}>
+                        <Tooltip contentStyle={{ backgroundColor: '#18181b', border: '1px solid #3f3f46', fontSize: '12px' }} labelStyle={{ color: '#a1a1aa' }}/>
+                        <defs><linearGradient id="colorCpu" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#82ca9d" stopOpacity={0.4}/><stop offset="95%" stopColor="#82ca9d" stopOpacity={0}/></linearGradient></defs>
+                        <Area type="monotone" dataKey="cpu" stroke="#82ca9d" fillOpacity={1} fill="url(#colorCpu)" strokeWidth={2}/>
+                        <YAxis stroke="#52525b" fontSize={12} unit="%"/>
+                        <XAxis dataKey="time" stroke="#52525b" fontSize={12} />
+                    </AreaChart>
+                </ResponsiveContainer>
+            </MetricChartCard>
+        </div>
+    );
+};
+
 export default function InstanceDetailPage() {
     const params = useParams();
     const router = useRouter();
@@ -150,8 +207,14 @@ export default function InstanceDetailPage() {
                 if (instRes.status === 401) { router.push('/login'); return; }
                 
                 if (instRes.ok) setInstance(await instRes.json());
-                if (jobsRes.ok) setJobs(await jobsRes.json() || []);
-                if (historyRes.ok) setHistory(await historyRes.json() || []);
+                if (jobsRes.ok) {
+                    const jobsData = await jobsRes.json();
+                    setJobs(Array.isArray(jobsData) ? jobsData : []);
+                }
+                if (historyRes.ok) {
+                    const historyData = await historyRes.json();
+                    setHistory(Array.isArray(historyData) ? historyData : []);
+                }
 
             } catch (err) {
                 console.error("Failed to fetch instance details:", err);
@@ -216,8 +279,9 @@ export default function InstanceDetailPage() {
     
     const memUsage = formatBytes(instance.state?.memory?.usage);
     const memTotal = formatBytes(instance.state?.memory?.total);
+    const diskUsage = formatBytes(instance.state?.root_device?.usage);
+    const diskTotal = formatBytes(instance.state?.root_device?.total);
     const memPercent = (instance.state?.memory?.usage && instance.state?.memory?.total) ? ((instance.state.memory.usage / instance.state.memory.total) * 100).toFixed(0) : 0;
-
     const cpuUsage = instance.state?.cpu?.usage ? instance.state.cpu.usage.toFixed(0) : 0;
 
     const chartData = history.map(h => ({
@@ -231,80 +295,44 @@ export default function InstanceDetailPage() {
             <Toaster position="bottom-right" theme="dark" richColors />
             {isTerminalOpen && <WebTerminal instanceName={instanceName} onClose={() => setTerminalOpen(false)} />}
             
-            <main className="grid grid-cols-3 gap-6">
-                
-                {/* Left Column */}
-                <div className="col-span-3 lg:col-span-2 space-y-6">
-                    {/* Hero Section Card */}
-                    <div className="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4">
-                        <div className="flex flex-col sm:flex-row justify-between sm:items-center">
-                            <div className="flex items-center gap-3">
-                                <h1 className="text-2xl font-bold text-zinc-100">{instance.name}</h1>
-                                <span className={`flex items-center gap-2 px-2 py-0.5 rounded-full text-xs ${isRunning ? 'bg-emerald-900/50 text-emerald-300' : 'bg-red-900/50 text-red-300'}`}>
-                                    <span className={`h-2 w-2 rounded-full ${isRunning ? 'bg-emerald-500' : 'bg-red-500'}`}></span>
-                                    {instance.status}
-                                </span>
-                            </div>
-                            <div className="flex items-center gap-4 text-sm text-zinc-400 mt-2 sm:mt-0">
-                                <div className="flex items-center gap-2 font-mono cursor-pointer" onClick={() => copyToClipboard(ipAddress)}>
-                                    {ipAddress} <Copy size={12}/>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                     {isRunning ? (
-                                        <>
-                                            <button onClick={() => handlePowerAction('stop')} className="px-3 py-1.5 text-sm rounded-md flex items-center gap-2 bg-red-900/50 border border-red-700/40 hover:bg-red-900/80 text-red-300 transition-colors"><Square size={14} /> Stop</button>
-                                            <button onClick={() => handlePowerAction('restart')} className="px-3 py-1.5 text-sm rounded-md flex items-center gap-2 bg-zinc-800 border border-zinc-700 hover:bg-zinc-700/80 text-zinc-200 transition-colors"><RefreshCw size={14} /> Restart</button>
-                                        </>
-                                    ) : (
-                                         <button onClick={() => handlePowerAction('start')} className="px-3 py-1.5 text-sm rounded-md flex items-center gap-2 bg-emerald-900/50 border border-emerald-700/40 hover:bg-emerald-900/80 text-emerald-300 transition-colors"><Play size={14} /> Start</button>
-                                    )}
-                                    <button onClick={() => setTerminalOpen(true)} disabled={!isRunning} className="px-3 py-1.5 text-sm rounded-md flex items-center gap-2 bg-zinc-800 border border-zinc-700 hover:bg-zinc-700/80 text-zinc-200 transition-colors disabled:opacity-50"><SquareTerminal size={14} /> Console</button>
-                                </div>
-                            </div>
-                        </div>
+            <div className="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 mb-6">
+                <div className="flex flex-col sm:flex-row justify-between sm:items-center">
+                    <div className="flex items-center gap-3">
+                        <h1 className="text-2xl font-bold text-zinc-100">{instance.name}</h1>
+                        <span className={`flex items-center gap-2 px-2 py-0.5 rounded-full text-xs ${isRunning ? 'bg-emerald-900/50 text-emerald-300' : 'bg-red-900/50 text-red-300'}`}>
+                            <span className={`h-2 w-2 rounded-full ${isRunning ? 'bg-emerald-500' : 'bg-red-500'}`}></span>
+                            {instance.status}
+                        </span>
                     </div>
-                    {/* Metrics Grid */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                        <MetricCard title="Memory Usage" value={`${memPercent}%`} subValue={`${memUsage.value}/${memTotal.value} ${memTotal.unit}`} icon={<MemoryStick size={16}/>} timeRange={timeRange} onTimeRangeChange={setTimeRange} hasData={chartData.length > 0}>
-                            <ResponsiveContainer width="100%" height="100%">
-                                <AreaChart data={chartData} margin={{ top: 5, right: 20, left: -10, bottom: 0 }}>
-                                    <Tooltip contentStyle={{ backgroundColor: '#18181b', border: '1px solid #3f3f46', fontSize: '12px' }} labelStyle={{ color: '#a1a1aa' }}/>
-                                    <defs><linearGradient id="colorMemory" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#8884d8" stopOpacity={0.4}/><stop offset="95%" stopColor="#8884d8" stopOpacity={0}/></linearGradient></defs>
-                                    <Area type="monotone" dataKey="memory" stroke="#8884d8" fillOpacity={1} fill="url(#colorMemory)" strokeWidth={2}/>
-                                    <YAxis stroke="#52525b" fontSize={12} unit="MB"/>
-                                    <XAxis dataKey="time" stroke="#52525b" fontSize={12} />
-                                </AreaChart>
-                            </ResponsiveContainer>
-                        </MetricCard>
-
-                         <MetricCard title="CPU Usage" value={`~${cpuUsage}%`} icon={<Cpu size={16}/>} timeRange={timeRange} onTimeRangeChange={setTimeRange} hasData={chartData.length > 0}>
-                            <ResponsiveContainer width="100%" height="100%">
-                                <AreaChart data={chartData} margin={{ top: 5, right: 20, left: -10, bottom: 0 }}>
-                                    <Tooltip contentStyle={{ backgroundColor: '#18181b', border: '1px solid #3f3f46', fontSize: '12px' }} labelStyle={{ color: '#a1a1aa' }}/>
-                                    <defs><linearGradient id="colorCpu" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#82ca9d" stopOpacity={0.4}/><stop offset="95%" stopColor="#82ca9d" stopOpacity={0}/></linearGradient></defs>
-                                    <Area type="monotone" dataKey="cpu" stroke="#82ca9d" fillOpacity={1} fill="url(#colorCpu)" strokeWidth={2}/>
-                                    <YAxis stroke="#52525b" fontSize={12} unit="%"/>
-                                    <XAxis dataKey="time" stroke="#52525b" fontSize={12} />
-                                </AreaChart>
-                            </ResponsiveContainer>
-                        </MetricCard>
+                    <div className="flex items-center gap-2 text-sm text-zinc-400 mt-3 sm:mt-0">
+                        {isRunning ? (
+                            <>
+                                <button onClick={() => handlePowerAction('stop')} className="px-3 py-1.5 text-sm rounded-md flex items-center gap-2 bg-red-900/50 border border-red-700/40 hover:bg-red-900/80 text-red-300 transition-colors"><Square size={14} /> Stop</button>
+                                <button onClick={() => handlePowerAction('restart')} className="px-3 py-1.5 text-sm rounded-md flex items-center gap-2 bg-zinc-800 border border-zinc-700 hover:bg-zinc-700/80 text-zinc-200 transition-colors"><RefreshCw size={14} /> Restart</button>
+                            </>
+                        ) : (
+                             <button onClick={() => handlePowerAction('start')} className="px-3 py-1.5 text-sm rounded-md flex items-center gap-2 bg-emerald-900/50 border border-emerald-700/40 hover:bg-emerald-900/80 text-emerald-300 transition-colors"><Play size={14} /> Start</button>
+                        )}
+                        <button onClick={() => setTerminalOpen(true)} disabled={!isRunning} className="px-3 py-1.5 text-sm rounded-md flex items-center gap-2 bg-zinc-800 border border-zinc-700 hover:bg-zinc-700/80 text-zinc-200 transition-colors disabled:opacity-50"><SquareTerminal size={14} /> Console</button>
                     </div>
                 </div>
+            </div>
 
-                {/* Right Column */}
-                <div className="col-span-3 lg:col-span-1 space-y-6">
+            <main className="space-y-6">
+                <div className="col-span-12">
+                   <PerformanceMetrics history={history} timeRange={timeRange} onTimeRangeChange={setTimeRange} cpuUsage={cpuUsage} memPercent={memPercent} memUsage={memUsage} memTotal={memTotal} />
+                </div>
+                
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    <InstanceInfoCard 
+                        node={instance.location || 'N/A'}
+                        ipAddress={ipAddress}
+                        vcpu={instance.config?.['limits.cpu'] ? parseInt(instance.config['limits.cpu']) : 0}
+                        ram={instance.config?.['limits.memory'] || 'N/A'}
+                        disk={`${diskUsage} / ${diskTotal}`}
+                    />
                     <DataProtectionCard instance={instance} />
-                    <div className="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4">
-                        <h3 className="font-semibold text-zinc-100 mb-4 flex items-center gap-2"><Calendar size={16}/> Audit Log</h3>
-                        <AuditLog jobs={jobs} instanceName={instanceName} />
-                    </div>
-                     <div className="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4">
-                        <h3 className="font-semibold text-zinc-100 mb-4 flex items-center gap-2"><Server size={16}/> Instance Details</h3>
-                         <div className="space-y-2 text-sm">
-                            <div className="flex justify-between items-center"><span className="text-zinc-400">Node</span><span className="font-mono">{instance.location}</span></div>
-                            <div className="flex justify-between items-center"><span className="text-zinc-400">Type</span><span className="font-mono capitalize">{instance.type?.replace('-', ' ')}</span></div>
-                        </div>
-                    </div>
+                    <AuditLog jobs={jobs} instanceName={instanceName} />
                 </div>
             </main>
         </div>

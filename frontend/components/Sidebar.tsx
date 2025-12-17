@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { LayoutDashboard, Box, Network, CalendarClock, Settings, LogOut } from 'lucide-react';
+import { LayoutDashboard, Box, Network, CalendarClock, Settings, LogOut, FileUp } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 
@@ -19,6 +19,11 @@ const Sidebar = () => {
       href: '/instances', 
       label: 'Instances', 
       icon: Box 
+    },
+    {
+      href: '/images',
+      label: 'Images',
+      icon: FileUp
     },
     { 
       href: '/networks', 

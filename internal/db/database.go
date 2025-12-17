@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
+	"aexon/internal/provider/lxc"
 	"aexon/internal/types"
+	"aexon/internal/utils"
 	"github.com/robfig/cron/v3"
 
 	_ "github.com/lib/pq"
@@ -103,11 +106,13 @@ func createTables() error {
 }
 
 func InsertMetric(m *Metric) error {
+	// Use current time in UTC for timestamp
+	now := time.Now().UTC()
 	query := `
-	INSERT INTO metrics (instance_name, cpu_percent, memory_usage, disk_usage)
-	VALUES ($1, $2, $3, $4)
+	INSERT INTO metrics (instance_name, timestamp, cpu_percent, memory_usage, disk_usage)
+	VALUES ($1, $2, $3, $4, $5)
 	`
-	_, err := DB.Exec(query, m.InstanceName, m.CPUPercent, m.MemoryUsage, m.DiskUsage)
+	_, err := DB.Exec(query, m.InstanceName, now, m.CPUPercent, m.MemoryUsage, m.DiskUsage)
 	return err
 }
 
@@ -221,7 +226,7 @@ func CreateJob(job *Job) error {
 	INSERT INTO jobs (id, type, target, payload, status, created_at, attempt_count, requested_by)
 	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	`
-	job.CreatedAt = time.Now()
+	job.CreatedAt = time.Now().UTC()
 	job.Status = types.JobPending
 	job.AttemptCount = 0
 
@@ -231,21 +236,21 @@ func CreateJob(job *Job) error {
 
 func MarkJobStarted(id string) error {
 	query := `
-	UPDATE jobs 
+	UPDATE jobs
 	SET status = $1, started_at = $2, attempt_count = attempt_count + 1
 	WHERE id = $3
 	`
-	_, err := DB.Exec(query, types.JobInProgress, time.Now(), id)
+	_, err := DB.Exec(query, types.JobInProgress, time.Now().UTC(), id)
 	return err
 }
 
 func MarkJobCompleted(id string) error {
 	query := `
-	UPDATE jobs 
+	UPDATE jobs
 	SET status = $1, finished_at = $2, error = NULL
 	WHERE id = $3
 	`
-	_, err := DB.Exec(query, types.JobCompleted, time.Now(), id)
+	_, err := DB.Exec(query, types.JobCompleted, time.Now().UTC(), id)
 	return err
 }
 
@@ -257,15 +262,15 @@ func MarkJobFailed(id string, errorMsg string, isFatal bool) error {
 
 	if isFatal {
 		query := `
-		UPDATE jobs 
+		UPDATE jobs
 		SET status = $1, error = $2, finished_at = $3
 		WHERE id = $4
 		`
-		_, err := DB.Exec(query, status, errorMsg, time.Now(), id)
+		_, err := DB.Exec(query, status, errorMsg, time.Now().UTC(), id)
 		return err
 	} else {
 		query := `
-		UPDATE jobs 
+		UPDATE jobs
 		SET status = $1, error = $2
 		WHERE id = $3
 		`
@@ -338,9 +343,9 @@ func ListRecentJobs(limit int) ([]Job, error) {
 
 func GetInstanceMetrics(instanceName string, interval string) ([]Metric, error) {
 	query := `
-	SELECT timestamp, cpu_percent, memory_usage 
-	FROM metrics 
-	WHERE instance_name = $1 AND timestamp > NOW() - $2::interval 
+	SELECT timestamp, cpu_percent, memory_usage, disk_usage
+	FROM metrics
+	WHERE instance_name = $1 AND timestamp > NOW() - $2::interval
 	ORDER BY timestamp ASC
 	`
 
@@ -353,7 +358,7 @@ func GetInstanceMetrics(instanceName string, interval string) ([]Metric, error) 
 	var metrics []Metric
 	for rows.Next() {
 		var m Metric
-		if err := rows.Scan(&m.Timestamp, &m.CPUPercent, &m.MemoryUsage); err != nil {
+		if err := rows.Scan(&m.Timestamp, &m.CPUPercent, &m.MemoryUsage, &m.DiskUsage); err != nil {
 			return nil, err
 		}
 		metrics = append(metrics, m)
@@ -438,6 +443,135 @@ func GetInstanceWithBackupInfo(name string) (*types.Instance, error) {
 	// Fix backup retention: if it's 0, set it to the default value of 7
 	if instance.BackupRetention == 0 {
 		instance.BackupRetention = 7
+	}
+
+	// Create and populate the backup info
+	backupInfo := &types.InstanceBackupInfo{
+		Enabled:  instance.BackupEnabled,
+		Schedule: instance.BackupSchedule,
+	}
+
+	// Get next run time if backup is enabled
+	if instance.BackupEnabled {
+		nextRun, err := GetNextRunTime(instance.BackupSchedule)
+		if err != nil {
+			log.Printf("Error calculating next backup run time for %s: %v", name, err)
+		} else {
+			backupInfo.NextRun = nextRun
+		}
+	}
+
+	// Get last backup job info
+	lastJob, err := GetLastBackupJob(name)
+	if err != nil {
+		log.Printf("Error getting last backup job for %s: %v", name, err)
+	} else if lastJob != nil {
+		backupInfo.LastRun = lastJob.FinishedAt
+		// Determine status based on job status
+		switch lastJob.Status {
+		case types.JobCompleted:
+			backupInfo.LastStatus = "completed"
+		case types.JobFailed:
+			backupInfo.LastStatus = "failed"
+		case types.JobCanceled:
+			backupInfo.LastStatus = "canceled"
+		case types.JobInProgress:
+			backupInfo.LastStatus = "in_progress"
+		default:
+			backupInfo.LastStatus = string(lastJob.Status)
+		}
+	}
+
+	// Set the backup info in the instance
+	instance.BackupInfo = backupInfo
+
+	return instance, nil
+}
+
+// GetInstanceWithHardwareInfo gets instance details with additional hardware information from LXD
+func GetInstanceWithHardwareInfo(name string, lxdClient *lxc.InstanceService) (*types.Instance, error) {
+	// Get the basic instance info
+	instance, err := GetInstance(name)
+	if err != nil {
+		return nil, err
+	}
+
+	// Fix backup retention: if it's 0, set it to the default value of 7
+	if instance.BackupRetention == 0 {
+		instance.BackupRetention = 7
+	}
+
+	// Get hardware information from LXD
+	inst, _, err := lxdClient.Server().GetInstance(name)
+	if err != nil {
+		log.Printf("Error getting instance from LXD for hardware info: %v", err)
+		// Still return the instance with basic info, but hardware fields will be zero values
+	} else {
+		// Extract node location (use hostname if empty for single node setup)
+		if inst.Location != "" {
+			instance.Node = inst.Location
+		} else {
+			hostname, err := os.Hostname()
+			if err != nil {
+				instance.Node = "local" // fallback to 'local' if hostname fails
+			} else {
+				instance.Node = hostname
+			}
+		}
+
+		// Extract CPU count from limits
+		if cpuLimit, ok := inst.Config["limits.cpu"]; ok {
+			instance.CPUCount = utils.ParseCpuCores(cpuLimit)
+		} else {
+			// Default to 1 if not specified
+			instance.CPUCount = 1
+		}
+
+		// Extract disk limit from ExpandedDevices["root"]["size"] as requested
+		if rootDevice, ok := inst.ExpandedDevices["root"]; ok {
+			if size, exists := rootDevice["size"]; exists {
+				instance.DiskLimit = utils.ParseMemoryToBytes(size)
+			}
+		} else if rootDevice, ok := inst.Devices["root"]; ok {
+			// Fallback to Devices if ExpandedDevices isn't available
+			if size, exists := rootDevice["size"]; exists {
+				instance.DiskLimit = utils.ParseMemoryToBytes(size)
+			}
+		}
+
+		// If still no size found, try from limits
+		if instance.DiskLimit == 0 {
+			if diskLimit, ok := inst.Config["limits.disk"]; ok {
+				instance.DiskLimit = utils.ParseMemoryToBytes(diskLimit)
+			}
+		}
+
+		// Get current disk usage and IP from state
+		state, _, stateErr := lxdClient.Server().GetInstanceState(name)
+		if stateErr == nil {
+			if rootDisk, ok := state.Disk["root"]; ok {
+				instance.DiskUsage = rootDisk.Usage
+			}
+
+			// Smart IP discovery: iterate through all network interfaces to find IPv4
+			for _, networkInfo := range state.Network {
+				if networkInfo.Type == "broadcast" { // ignore loopback
+					for _, addr := range networkInfo.Addresses {
+						if addr.Family == "inet" { // IPv4
+							// Store IP in limits if instance has an IP
+							if instance.Limits == nil {
+								instance.Limits = make(map[string]string)
+							}
+							instance.Limits["volatile.ip_address"] = addr.Address
+							break // Found primary IPv4 address, break inner loop
+						}
+					}
+					if instance.Limits["volatile.ip_address"] != "" {
+						break // Found IP, break outer loop
+					}
+				}
+			}
+		}
 	}
 
 	// Create and populate the backup info

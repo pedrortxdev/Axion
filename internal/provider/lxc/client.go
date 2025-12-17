@@ -237,14 +237,50 @@ func (s *InstanceService) ListInstances() ([]InstanceMetric, error) {
 			if rootDisk, ok := state.Disk["root"]; ok {
 				diskBytes = rootDisk.Usage
 			}
-			if eth0, ok := state.Network["eth0"]; ok {
-				netRxBytes = int64(eth0.Counters.BytesReceived)
-				netTxBytes = int64(eth0.Counters.BytesSent)
+
+			// Smart IP discovery: iterate through all network interfaces
+			var primaryIP string
+			for _, networkInfo := range state.Network {
+				if networkInfo.Type == "broadcast" { // ignore loopback
+					for _, addr := range networkInfo.Addresses {
+						if addr.Family == "inet" { // IPv4
+							primaryIP = addr.Address
+							break // Found primary IPv4 address
+						}
+					}
+					if primaryIP != "" {
+						break // Stop at first interface with IPv4
+					}
+				}
+			}
+
+			// Add IP to config if found
+			if primaryIP != "" {
+				inst.Config["volatile.ip_address"] = primaryIP
+			}
+
+			// Calculate network usage
+			for _, networkInfo := range state.Network {
+				if networkInfo.Type == "broadcast" {
+					netRxBytes += int64(networkInfo.Counters.BytesReceived)
+					netTxBytes += int64(networkInfo.Counters.BytesSent)
+				}
+			}
+		}
+
+		// Determine location/node (use hostname if location is empty for single-node setup)
+		location := inst.Location
+		if location == "" {
+			hostname, err := os.Hostname()
+			if err != nil {
+				location = "local" // fallback to 'local' if hostname fails
+			} else {
+				location = hostname
 			}
 		}
 
 		metrics = append(metrics, InstanceMetric{
-			Location:         inst.Location,
+			Location:         location,
 			Name:             inst.Name,
 			Type:             inst.Type,
 			Status:           strings.ToUpper(inst.Status),
@@ -468,9 +504,14 @@ func (s *InstanceService) CreateInstanceWithISO(name string, imageAlias string, 
 	}
 
 	// VM-specific configurations for ISO boot
-	config["security.secureboot"] = "false"
-	config["security.csm"] = "true"  // Enable CSM for legacy boot support
-	config["boot.autostart"] = "true"  // Make sure VM starts automatically
+	config["security.secureboot"] = "false"  // Critical for Windows/compatibility
+	// Apply minimum limits if not provided
+	if config["limits.cpu"] == "" {
+		config["limits.cpu"] = "2"  // Default to 2 CPUs minimum
+	}
+	if config["limits.memory"] == "" {
+		config["limits.memory"] = "4GB"  // Default to 4GB RAM minimum
+	}
 	config["volatile.base_image"] = "custom-iso"  // Indicate this is a custom ISO installation
 
 	if userData != "" {
@@ -498,12 +539,12 @@ func (s *InstanceService) CreateInstanceWithISO(name string, imageAlias string, 
 					"name":    "eth0",
 					"network": "axion-br",
 				},
-				// Add ISO device to boot from
+				// Add ISO device as bootable disk
 				"iso": {
-					"type":     "disk",
-					"source":   isoPath,      // Path to the ISO file
-					"path":     "/dev/sr0",   // CD-ROM device path
-					"readonly": "true",
+					"type":    "disk",
+					"source":  isoPath,       // Path to the ISO file
+					"pool":    "axion",       // Use the default storage pool
+					"boot.priority": "10",    // High boot priority for ISO
 				},
 			},
 			Profiles: []string{"default"},

@@ -76,37 +76,43 @@ export default function InstancesPage() {
 
   // --- WebSocket Telementry ---
   useEffect(() => {
-    if (!token) return;
+    if (!token) {
+        console.warn("WebSocket connection skipped: no token provided.");
+        return;
+    }
 
+    // Define the WebSocket URL with the hardcoded port 8500
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.hostname;
     const wsUrl = `${protocol}//${host}:8500/ws/telemetry?token=${token}`;
 
+    let reconnectTimeout: NodeJS.Timeout;
+
     const connect = () => {
+      // Prevent multiple connections
+      if (wsRef.current && wsRef.current.readyState < 2) { // <2 means CONNECTING or OPEN
+          return;
+      }
+
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
-        console.log('WebSocket connected');
+        console.log('WebSocket connected to :8500');
       };
 
       ws.onmessage = (event) => {
         try {
           const rawData = JSON.parse(event.data);
           
-          if (Array.isArray(rawData)) {
-            setMetrics(rawData);
-            return;
-          }
-          
           if (rawData && rawData.type === 'instance_metrics') {
             setMetrics(rawData.data);
-          }
-          if (rawData && rawData.type === 'instance_history') {
+          } else if (rawData && rawData.type === 'instance_history') {
             setHistory(rawData.data);
-          }
-          if (rawData && rawData.type === 'jobs_update') {
+          } else if (rawData && rawData.type === 'jobs_update') {
             setJobs(rawData.data);
+          } else if (Array.isArray(rawData)) { // Fallback for initial full list
+            setMetrics(rawData);
           }
 
         } catch (err) {
@@ -114,24 +120,30 @@ export default function InstancesPage() {
         }
       };
 
-      ws.onclose = () => {
-        console.log('WebSocket disconnected, attempting to reconnect...');
-        // Clean up the old socket
-        wsRef.current = null;
-        // Reconnect after a delay
-        setTimeout(connect, 5000);
-      };
-
-      ws.onerror = (err) => {
-        console.error('WebSocket error:', err);
+      ws.onerror = (event) => {
+        // Use console.warn for less intrusive error logging
+        console.warn('WebSocket error:', event);
+        // The onclose event will be fired next, which will handle reconnection.
         ws.close();
+      };
+      
+      ws.onclose = () => {
+        console.log('WebSocket disconnected. Attempting to reconnect in 5 seconds...');
+        // Clear any existing timeout to avoid multiple reconnection loops
+        clearTimeout(reconnectTimeout);
+        // Set a timeout to reconnect
+        reconnectTimeout = setTimeout(connect, 5000);
       };
     };
 
     connect();
 
+    // Cleanup on component unmount
     return () => {
+      clearTimeout(reconnectTimeout); // Clear the timeout on unmount
       if (wsRef.current) {
+        // Remove the onclose listener before closing to prevent reconnection attempts on manual close
+        wsRef.current.onclose = null; 
         wsRef.current.close();
       }
     };
@@ -465,7 +477,7 @@ export default function InstancesPage() {
                 </div>
                 <div className="bg-zinc-900/30 p-3 rounded-lg border border-zinc-800/50">
                   <div className="flex items-center gap-2 mb-1 text-zinc-500"><Cpu size={12} strokeWidth={1.5} /><span className="text-[10px] uppercase tracking-wider font-semibold">Memory</span></div>
-                  <p className="text-sm font-mono text-zinc-200">{formatBytes(inst.memory_usage_bytes).value} {formatBytes(inst.memory_usage_bytes).unit}</p>
+                  <p className="text-sm font-mono text-zinc-200">{formatBytes(inst.memory_usage_bytes)}</p>
                 </div>
               </div>
 

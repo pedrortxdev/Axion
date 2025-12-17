@@ -67,6 +67,10 @@ export interface InstanceState {
         swap_usage_peak: number;
         total: number;
     };
+    root_device?: {
+        usage: number;
+        total: number;
+    };
     network: {
         [interfaceName: string]: {
             addresses: {

@@ -17,11 +17,13 @@ interface InstanceMetricsChartsProps {
 }
 
 const formatBytes = (bytes: number) => {
-  if (bytes === 0) return '0 B';
+  if (bytes === 0 || isNaN(bytes)) return '0 B';
   const k = 1024;
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  // Proteção para não estourar o array se o número for absurdamente grande ou pequeno
+  const size = sizes[i] || sizes[sizes.length - 1]; 
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + size;
 };
 
 export default function InstanceMetricsCharts({ instanceName, token }: InstanceMetricsChartsProps) {
@@ -68,17 +70,20 @@ export default function InstanceMetricsCharts({ instanceName, token }: InstanceM
     label?: string;
   }
 
+  // CORREÇÃO AQUI: Tooltip agora é dinâmico baseado no dataKey
   const CustomTooltip = ({ active, payload, label }: CustomTooltipProps) => {
     if (active && payload && payload.length) {
+      const data = payload[0];
+      const isMemory = data.dataKey === 'memory_usage';
+      const value = data.value;
+
       return (
         <div className="bg-zinc-900/80 backdrop-blur-sm border border-zinc-700 rounded-lg p-3 text-sm shadow-lg">
-          <p className="label text-zinc-400">{`${new Date(label!).toLocaleString()}`}</p>
-          {payload[0] && payload[0].value !== undefined && (
-            <p className="intro text-indigo-400">{`Memory: ${formatBytes(payload[0].value)}`}</p>
-          )}
-          {payload[1] && payload[1].value !== undefined && (
-            <p className="intro text-cyan-400">{`CPU: ${payload[1].value !== undefined && payload[1].value !== null ? payload[1].value.toFixed(2) : '0.00'} %`}</p>
-          )}
+          <p className="label text-zinc-400 mb-1">{`${new Date(label!).toLocaleString()}`}</p>
+          <p className={`font-medium ${isMemory ? 'text-indigo-400' : 'text-cyan-400'}`}>
+            {isMemory ? 'Memory: ' : 'CPU: '}
+            {isMemory ? formatBytes(value) : `${value !== undefined && value !== null ? value.toFixed(2) : '0.00'} %`}
+          </p>
         </div>
       );
     }
@@ -86,53 +91,57 @@ export default function InstanceMetricsCharts({ instanceName, token }: InstanceM
   };
 
   const renderChart = (title: string, dataKey: "memory_usage" | "cpu_percent", color: string) => (
-    <div className="h-64 bg-zinc-900/50 p-4 rounded-lg border border-zinc-800">
+    <div className="bg-zinc-900/50 p-4 rounded-lg border border-zinc-800" style={{ height: '300px' }}>
       <h4 className="text-sm font-medium text-zinc-300 mb-4">{title}</h4>
-      <ResponsiveContainer width="100%" height="100%">
-        {loading ? (
-          <div className="flex items-center justify-center h-full text-zinc-500">
-            <Loader2 size={24} className="animate-spin" />
+      {loading ? (
+        <div className="flex items-center justify-center h-full text-zinc-500">
+          <Loader2 size={24} className="animate-spin" />
+        </div>
+      ) : error ? (
+          <div className="flex items-center justify-center h-full text-red-400/80">
+               <ServerCrash size={24} /> <span className="ml-2">Error loading data</span>
           </div>
-        ) : error ? (
-            <div className="flex items-center justify-center h-full text-red-400/80">
-                 <ServerCrash size={24} /> <span className="ml-2">Error loading data</span>
-            </div>
-        ) : metrics.length === 0 ? (
-             <div className="flex items-center justify-center h-full text-zinc-500">
-                Coletando dados...
-            </div>
-        ) : (
-          <AreaChart data={metrics}>
-            <defs>
-              <linearGradient id={`gradient-${dataKey}`} x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%" stopColor={color} stopOpacity={0.3} />
-                <stop offset="95%" stopColor={color} stopOpacity={0} />
-              </linearGradient>
-            </defs>
-            <CartesianGrid strokeDasharray="3 3" strokeOpacity={0.1} />
-            <XAxis 
-              dataKey="timestamp" 
-              tickFormatter={(ts) => new Date(ts).toLocaleTimeString()}
-              stroke="#9ca3af"
-              fontSize={12}
-              tickLine={false}
-              axisLine={false}
-            />
-            <YAxis 
-              tickFormatter={(value) => dataKey === 'memory_usage' ? formatBytes(value) : `${value}%`}
-              stroke="#9ca3af"
-              fontSize={12}
-              tickLine={false}
-              axisLine={false}
-            />
-            <Tooltip content={<CustomTooltip />} />
-            <Area type="monotone" dataKey={dataKey} stroke={color} strokeWidth={2} fill={`url(#gradient-${dataKey})`} />
-          </AreaChart>
-        )}
-      </ResponsiveContainer>
+      ) : metrics.length > 0 ? (
+        <div style={{ width: '100%', height: 300, minHeight: 300 }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={metrics}>
+              <defs>
+                <linearGradient id={`gradient-${dataKey}`} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor={color} stopOpacity={0.3} />
+                  <stop offset="95%" stopColor={color} stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" strokeOpacity={0.1} />
+              <XAxis 
+                dataKey="timestamp" 
+                tickFormatter={(ts) => new Date(ts).toLocaleTimeString()}
+                stroke="#9ca3af"
+                fontSize={12}
+                tickLine={false}
+                axisLine={false}
+                minTickGap={30}
+              />
+              <YAxis 
+                tickFormatter={(value) => dataKey === 'memory_usage' ? formatBytes(value) : `${value.toFixed(0)}%`}
+                stroke="#9ca3af"
+                fontSize={12}
+                tickLine={false}
+                axisLine={false}
+                width={60}
+              />
+              <Tooltip content={<CustomTooltip />} />
+              <Area type="monotone" dataKey={dataKey} stroke={color} strokeWidth={2} fill={`url(#gradient-${dataKey})`} />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      ) : (
+        <div className="flex items-center justify-center h-full text-zinc-500">
+          Coletando dados...
+        </div>
+      )}
     </div>
   );
-  
+   
   return (
     <div className="space-y-6">
       <div className="flex justify-between items-center">

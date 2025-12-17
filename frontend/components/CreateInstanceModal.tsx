@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
-import { X, Server, Box, Zap, FileCode, Code, Loader2, Monitor, User, Key, Network } from 'lucide-react';
+import { X, Server, Box, Zap, FileCode, Code, Loader2, Monitor, User, Key, Network, FileUp } from 'lucide-react';
 import { toast } from 'sonner';
 
 interface Template {
@@ -73,6 +73,7 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
   const [image, setImage] = useState(initialType === 'container' ? CONTAINER_IMAGES[0].value : VM_IMAGES[0].value);
   const [cpu, setCpu] = useState(1);
   const [memory, setMemory] = useState(512);
+  const [disk, setDisk] = useState(10); // Default 10GB
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
   const [templateId, setTemplateId] = useState('none');
@@ -83,6 +84,14 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
   const [templates, setTemplates] = useState<Template[]>([]);
   const [loadingTemplates, setLoadingTemplates] = useState(false);
   const [selectedTemplate, setSelectedTemplate] = useState<Template | null>(null);
+  const [installMethod, setInstallMethod] = useState<'template' | 'iso'>('template');
+  const [isoImages, setIsoImages] = useState<IsoImage[]>([]);
+  const [selectedIso, setSelectedIso] = useState<string>('');
+
+  interface IsoImage {
+    name: string;
+    size: number;
+  }
 
   // Update defaults when initialType changes or modal opens
   useEffect(() => {
@@ -99,6 +108,8 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
         setUserData('');
         setShowAdvanced(false);
         setSelectedTemplate(null);
+        setInstallMethod('template');
+        setSelectedIso('');
     }
   }, [isOpen, initialType]);
   
@@ -129,12 +140,41 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
     }
   }, [token]);
 
+  const fetchIsoImages = React.useCallback(async () => {
+    if (!token) return;
+    try {
+        const protocol = window.location.protocol;
+        const host = window.location.hostname;
+        const port = '8500';
+        const response = await fetch(`${protocol}//${host}:${port}/isos`, {
+            headers: {
+                'Authorization': `Bearer ${token}`
+            },
+        });
+        if (response.ok) {
+            const data = await response.json();
+            setIsoImages(data || []);
+            if (data && data.length > 0) {
+              setSelectedIso(data[0].name);
+            }
+        } else {
+            toast.error('Failed to load ISOs', { description: 'Could not fetch available ISO images' });
+        }
+    } catch (error) {
+        toast.error('Network Error', { description: 'Could not reach control plane for ISOs' });
+    }
+}, [token]);
+
+
   // Fetch templates when modal opens
   useEffect(() => {
-    if (isOpen && activeTab === 'templates') {
-      fetchTemplates();
+    if (isOpen) {
+      if (activeTab === 'templates') {
+        fetchTemplates();
+      }
+      fetchIsoImages();
     }
-  }, [isOpen, activeTab, fetchTemplates]);
+  }, [isOpen, activeTab, fetchTemplates, fetchIsoImages]);
 
   const generateUserData = React.useCallback(() => {
     // Use selected template if one is selected, otherwise use legacy templates
@@ -266,19 +306,25 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
       let payload: any = {
         name: name.trim(),
         type: type,
-        image: image,
         limits: {
           "limits.cpu": cpu.toString(),
           "limits.memory": `${memory}MB`
         },
       };
 
-      // Only add user_data if we're not using a template or using legacy templates
-      if (!selectedTemplate) {
-        payload.user_data = userData;
+      if (type === 'virtual-machine' && installMethod === 'iso') {
+        payload.iso_image = selectedIso;
+        payload.limits["limits.rootfs"] = `${disk}GB`;
+        // No user_data or template_id for ISO installs
       } else {
-        // If using a new template, add the template_id
-        payload.template_id = selectedTemplate.id;
+        payload.image = image;
+        // Only add user_data if we're not using a template or using legacy templates
+        if (!selectedTemplate) {
+          payload.user_data = userData;
+        } else {
+          // If using a new template, add the template_id
+          payload.template_id = selectedTemplate.id;
+        }
       }
 
       const response = await fetch(`${protocol}//${host}:${port}/instances`, {
@@ -370,6 +416,23 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
                     <Server size={16} className="text-zinc-500" /> Configuration
                   </h3>
 
+                  {type === 'virtual-machine' && (
+                    <div className="flex items-center gap-2 bg-zinc-900/50 border border-zinc-800 rounded-lg p-1 w-max">
+                        <button 
+                            onClick={() => setInstallMethod('template')}
+                            className={`px-3 py-1.5 text-xs rounded-md transition-colors ${installMethod === 'template' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:text-zinc-200'}`}
+                        >
+                            From Template
+                        </button>
+                        <button 
+                            onClick={() => setInstallMethod('iso')}
+                            className={`px-3 py-1.5 text-xs rounded-md transition-colors ${installMethod === 'iso' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:text-zinc-200'}`}
+                        >
+                            From ISO
+                        </button>
+                    </div>
+                  )}
+
                   <div className="grid grid-cols-2 gap-6">
                     <div>
                       <label className="block text-xs font-medium text-zinc-400 mb-1.5 uppercase tracking-wider">Name</label>
@@ -383,23 +446,48 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
                       />
                     </div>
 
-                    <div>
-                      <label className="block text-xs font-medium text-zinc-400 mb-1.5 uppercase tracking-wider">Image</label>
-                      <div className="relative">
-                        <select
-                          value={image}
-                          onChange={(e) => setImage(e.target.value)}
-                          className="w-full bg-zinc-900/50 border border-zinc-800 text-zinc-200 rounded-lg px-4 py-2.5 appearance-none focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 transition-all cursor-pointer"
-                        >
-                          {imagesList.map(img => (
-                            <option key={img.value} value={img.value}>{img.label}</option>
-                          ))}
-                        </select>
-                        <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-zinc-500">
-                          <Server size={16} />
+                    {installMethod === 'iso' ? (
+                        <div>
+                            <label className="block text-xs font-medium text-zinc-400 mb-1.5 uppercase tracking-wider">ISO Image</label>
+                            <div className="relative">
+                                <select
+                                    value={selectedIso}
+                                    onChange={(e) => setSelectedIso(e.target.value)}
+                                    className="w-full bg-zinc-900/50 border border-zinc-800 text-zinc-200 rounded-lg px-4 py-2.5 appearance-none focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 transition-all cursor-pointer"
+                                    disabled={isoImages.length === 0}
+                                >
+                                    {isoImages.length > 0 ? (
+                                        isoImages.map(iso => (
+                                            <option key={iso.name} value={iso.name}>{iso.name}</option>
+                                        ))
+                                    ) : (
+                                        <option>No ISOs available</option>
+                                    )}
+                                </select>
+                                <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-zinc-500">
+                                    <FileUp size={16} />
+                                </div>
+                            </div>
                         </div>
-                      </div>
-                    </div>
+                    ) : (
+                        <div>
+                            <label className="block text-xs font-medium text-zinc-400 mb-1.5 uppercase tracking-wider">Image</label>
+                            <div className="relative">
+                                <select
+                                    value={image}
+                                    onChange={(e) => setImage(e.target.value)}
+                                    className="w-full bg-zinc-900/50 border border-zinc-800 text-zinc-200 rounded-lg px-4 py-2.5 appearance-none focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 transition-all cursor-pointer"
+                                >
+                                    {imagesList.map(img => (
+                                        <option key={img.value} value={img.value}>{img.label}</option>
+                                    ))}
+                                </select>
+                                <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-zinc-500">
+                                    <Server size={16} />
+                                </div>
+                            </div>
+                        </div>
+                    )}
                   </div>
                 </div>
 
@@ -443,6 +531,25 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
                         className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-indigo-500 hover:accent-indigo-400"
                       />
                     </div>
+
+                    {/* Disk */}
+                    {type === 'virtual-machine' && (
+                        <div>
+                            <div className="flex justify-between items-center mb-2">
+                                <span className="text-xs text-zinc-400">Disk Size</span>
+                                <span className="text-xs font-mono text-indigo-400 bg-indigo-500/10 px-2 py-0.5 rounded border border-indigo-500/20">{disk} GB</span>
+                            </div>
+                            <input
+                                type="range"
+                                min="10"
+                                max="100"
+                                step="5"
+                                value={disk}
+                                onChange={(e) => setDisk(parseInt(e.target.value))}
+                                className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-indigo-500 hover:accent-indigo-400"
+                            />
+                        </div>
+                    )}
                   </div>
                 </div>
 
@@ -505,72 +612,74 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
                 </div>
 
                 {/* Templates */}
-                <div className="space-y-4">
-                  <h3 className="text-sm font-medium text-zinc-300 flex items-center gap-2">
-                    <FileCode size={16} className="text-zinc-500" /> Cloud-Init Template
-                  </h3>
+                {installMethod === 'template' && (
+                    <div className="space-y-4">
+                    <h3 className="text-sm font-medium text-zinc-300 flex items-center gap-2">
+                        <FileCode size={16} className="text-zinc-500" /> Cloud-Init Template
+                    </h3>
 
-                  <div className="space-y-4">
-                    <div>
-                      <label className="block text-xs font-medium text-zinc-400 mb-1.5">Select Template</label>
-                      <div className="grid grid-cols-2 gap-3">
-                        {LEGACY_TEMPLATES.map(tmpl => (
-                          <button
-                            key={tmpl.id}
-                            type="button"
-                            onClick={() => {
-                              setTemplateId(tmpl.id);
-                              setSelectedTemplate(null); // Reset new template selection
-                            }}
-                            className={`
-                              text-left p-3 rounded-lg border transition-all relative overflow-hidden
-                              ${templateId === tmpl.id
-                                ? 'bg-indigo-600/10 border-indigo-500/50 ring-1 ring-indigo-500/20'
-                                : 'bg-zinc-900/30 border-zinc-800 hover:bg-zinc-900 hover:border-zinc-700'
-                              }
-                            `}
-                          >
-                            <div className="flex justify-between items-start mb-1">
-                              <span className={`text-sm font-medium ${templateId === tmpl.id ? 'text-indigo-400' : 'text-zinc-300'}`}>
-                                {tmpl.label}
-                              </span>
-                              {templateId === tmpl.id && <div className="h-2 w-2 rounded-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.6)]"></div>}
-                            </div>
-                            <p className="text-[11px] text-zinc-500 leading-tight">{tmpl.description}</p>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* YAML Editor */}
-                    <div>
-                      <div className="flex justify-between items-center mb-2">
-                        <label className="text-xs font-medium text-zinc-400">Resulting YAML (Preview)</label>
-                        <button
-                          type="button"
-                          onClick={() => setShowAdvanced(!showAdvanced)}
-                          className="text-xs text-zinc-500 hover:text-indigo-400 flex items-center gap-1 transition-colors"
-                        >
-                          <Code size={12} />
-                          {showAdvanced ? 'Hide Editor' : 'Edit YAML'}
-                        </button>
-                      </div>
-
-                      {showAdvanced ? (
-                        <textarea
-                          value={userData}
-                          onChange={(e) => setUserData(e.target.value)}
-                          className="w-full h-48 bg-black/50 border border-zinc-800 rounded-lg p-3 font-mono text-xs text-zinc-300 focus:outline-none focus:border-indigo-500/50 resize-y"
-                          placeholder="#cloud-config..."
-                        />
-                      ) : (
-                        <div className="w-full h-48 bg-black/50 border border-zinc-800 rounded-lg p-3 font-mono text-xs text-zinc-300 overflow-y-auto whitespace-pre-wrap overflow-x-auto">
-                          {userData || <span className="text-zinc-600 italic">Select a template or enable editor to view YAML</span>}
+                    <div className="space-y-4">
+                        <div>
+                        <label className="block text-xs font-medium text-zinc-400 mb-1.5">Select Template</label>
+                        <div className="grid grid-cols-2 gap-3">
+                            {LEGACY_TEMPLATES.map(tmpl => (
+                            <button
+                                key={tmpl.id}
+                                type="button"
+                                onClick={() => {
+                                setTemplateId(tmpl.id);
+                                setSelectedTemplate(null); // Reset new template selection
+                                }}
+                                className={`
+                                text-left p-3 rounded-lg border transition-all relative overflow-hidden
+                                ${templateId === tmpl.id
+                                    ? 'bg-indigo-600/10 border-indigo-500/50 ring-1 ring-indigo-500/20'
+                                    : 'bg-zinc-900/30 border-zinc-800 hover:bg-zinc-900 hover:border-zinc-700'
+                                }
+                                `}
+                            >
+                                <div className="flex justify-between items-start mb-1">
+                                <span className={`text-sm font-medium ${templateId === tmpl.id ? 'text-indigo-400' : 'text-zinc-300'}`}>
+                                    {tmpl.label}
+                                </span>
+                                {templateId === tmpl.id && <div className="h-2 w-2 rounded-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.6)]"></div>}
+                                </div>
+                                <p className="text-[11px] text-zinc-500 leading-tight">{tmpl.description}</p>
+                            </button>
+                            ))}
                         </div>
-                      )}
+                        </div>
+
+                        {/* YAML Editor */}
+                        <div>
+                        <div className="flex justify-between items-center mb-2">
+                            <label className="text-xs font-medium text-zinc-400">Resulting YAML (Preview)</label>
+                            <button
+                            type="button"
+                            onClick={() => setShowAdvanced(!showAdvanced)}
+                            className="text-xs text-zinc-500 hover:text-indigo-400 flex items-center gap-1 transition-colors"
+                            >
+                            <Code size={12} />
+                            {showAdvanced ? 'Hide Editor' : 'Edit YAML'}
+                            </button>
+                        </div>
+
+                        {showAdvanced ? (
+                            <textarea
+                            value={userData}
+                            onChange={(e) => setUserData(e.target.value)}
+                            className="w-full h-48 bg-black/50 border border-zinc-800 rounded-lg p-3 font-mono text-xs text-zinc-300 focus:outline-none focus:border-indigo-500/50 resize-y"
+                            placeholder="#cloud-config..."
+                            />
+                        ) : (
+                            <div className="w-full h-48 bg-black/50 border border-zinc-800 rounded-lg p-3 font-mono text-xs text-zinc-300 overflow-y-auto whitespace-pre-wrap overflow-x-auto">
+                            {userData || <span className="text-zinc-600 italic">Select a template or enable editor to view YAML</span>}
+                            </div>
+                        )}
+                        </div>
                     </div>
-                  </div>
-                </div>
+                    </div>
+                )}
               </>
             ) : (
               // Templates Tab
