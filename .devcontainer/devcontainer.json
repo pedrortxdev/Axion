@@ -1,33 +1,21 @@
 {
   "name": "Axion Dev Container",
   "image": "mcr.microsoft.com/devcontainers/go:1-1.22-bookworm",
-  
-  // Habilita permissões avançadas (útil se você tentar rodar Docker/LXD dentro)
+
+  // Mantemos o modo privilegiado para suas tentativas futuras com LXD
   "runArgs": [
     "--privileged",
     "--cgroupns=host"
   ],
 
   "features": {
-    // Instala Docker (opcional, mas bom ter)
     "ghcr.io/devcontainers/features/docker-in-docker:2": {},
-    
-    // 🔥 A MÁGICA DO BANCO DE DADOS 🔥
-    // Isso instala o Postgres e já cria o usuário/senha/db para você!
-    "ghcr.io/devcontainers/features/postgres:1": {
-      "version": "16",
-      "username": "axion",
-      "password": "axion_password",
-      "database": "axion_db"
-    },
-    
-    // Ferramentas úteis de rede (curl, ip, etc)
     "ghcr.io/devcontainers/features/common-utils:2": {
       "configureZshAsDefaultShell": true
     }
+    // REMOVEMOS O POSTGRES DAQUI POIS ESTAVA DANDO ERRO DE DOWNLOAD
   },
 
-  // Extensões do VS Code que serão instaladas sozinhas
   "customizations": {
     "vscode": {
       "extensions": [
@@ -39,12 +27,14 @@
     }
   },
 
-  // Comandos para rodar assim que o container criar
-  // 1. Garante que as dependências do Go estão baixadas
-  // 2. Instala dependências do Frontend (se a pasta existir)
-  "postCreateCommand": "go mod tidy && cd frontend && npm install",
+  // COMANDO MÁGICO:
+  // 1. Atualiza lista de pacotes
+  // 2. Instala Postgres via apt-get
+  // 3. Inicia o serviço
+  // 4. Cria o usuário 'axion' e o banco 'axion_db' na marra (se falhar é pq já existe, o || true ignora erro)
+  // 5. Instala deps do Go e Node
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y postgresql postgresql-contrib && sudo service postgresql start && sudo -u postgres psql -c \"CREATE USER axion WITH PASSWORD 'axion_password' SUPERUSER;\" || true && sudo -u postgres psql -c \"CREATE DATABASE axion_db OWNER axion;\" || true && go mod tidy && cd frontend && npm install",
 
-  // Variáveis de ambiente globais para o container
   "remoteEnv": {
     "DB_HOST": "localhost",
     "DB_USER": "axion",
@@ -53,6 +43,5 @@
     "DB_PORT": "5432"
   },
 
-  // Expõe as portas (Frontend: 3500, Backend: 8500, DB: 5432)
   "forwardPorts": [3500, 8500, 5432]
 }
