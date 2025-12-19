@@ -148,7 +148,7 @@ sudo apt install postgresql postgresql-contrib
 # Configure um banco de dados e usuário para o Axion
 sudo -u postgres psql
 CREATE DATABASE axion;
-CREATE USER axion_user WITH PASSWORD 'sua_senha_segura';
+CREATE USER axion_user WITH PASSWORD 'axion_password';
 GRANT ALL PRIVILEGES ON DATABASE axion TO axion_user;
 \q
 ```
@@ -157,7 +157,7 @@ GRANT ALL PRIVILEGES ON DATABASE axion TO axion_user;
 
 #### 1. Clone o Repositório
 ```bash
-git clone https://github.com/seuusuario/axion.git
+git clone https://github.com/pedrortxdev/axion.git
 cd axion
 ```
 
@@ -190,7 +190,7 @@ cp .env.example .env
 # 3. Inicie o servidor de desenvolvimento
 npm run dev
 ```
-O Dashboard estará acessível em `http://localhost:3000`.
+O Dashboard estará acessível em `http://localhost:3500`.
 
 ### Estrutura de Desenvolvimento
 ```
