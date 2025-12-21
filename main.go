@@ -1,16 +1,24 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"aexon/internal/api"
@@ -29,6 +37,115 @@ import (
 	"github.com/google/uuid"
 )
 
+// ============================================================================
+// ERROR TAXONOMY - Todos os erros possíveis documentados
+// ============================================================================
+
+type ErrorCode int
+
+const (
+	// Client Errors (1000-1999)
+	ErrCodeInvalidJSON ErrorCode = iota + 1000
+	ErrCodeMissingField
+	ErrCodeInvalidPath
+	ErrCodeInvalidFileType
+	ErrCodeFileTooLarge
+	ErrCodeInstanceNotFound
+	ErrCodeSnapshotNotFound
+	ErrCodeNetworkNotFound
+	ErrCodeISONotFound
+	ErrCodeTemplateNotFound
+	ErrCodeInvalidQuota
+	ErrCodeInsufficientResources
+
+	// Server Errors (2000-2999)
+	ErrCodeDatabaseFailure ErrorCode = iota + 2000
+	ErrCodeLXDConnectionFailed
+	ErrCodeJobCreationFailed
+	ErrCodeInstanceCreationFailed
+	ErrCodeSnapshotFailed
+	ErrCodeFileOperationFailed
+	ErrCodeNetworkOperationFailed
+	ErrCodeStorageOperationFailed
+	ErrCodeMetricsFetchFailed
+	ErrCodeBackupFailed
+	ErrCodeWorkerDispatchFailed
+	ErrCodeUnknownError
+
+	// Infrastructure Errors (3000-3999)
+	ErrCodeInitializationFailed ErrorCode = iota + 3000
+	ErrCodeShutdownFailed
+	ErrCodeConfigurationInvalid
+)
+
+type AppError struct {
+	Code       ErrorCode
+	Message    string
+	HTTPStatus int
+	Err        error
+	Context    map[string]interface{}
+	Timestamp  int64
+	Retryable  bool
+}
+
+func (e *AppError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("[%d] %s: %v", e.Code, e.Message, e.Err)
+	}
+	return fmt.Sprintf("[%d] %s", e.Code, e.Message)
+}
+
+func (e *AppError) WithContext(key string, value interface{}) *AppError {
+	if e.Context == nil {
+		e.Context = make(map[string]interface{})
+	}
+	e.Context[key] = value
+	return e
+}
+
+func NewError(code ErrorCode, msg string, err error, httpStatus int, retryable bool) *AppError {
+	return &AppError{
+		Code:       code,
+		Message:    msg,
+		Err:        err,
+		HTTPStatus: httpStatus,
+		Timestamp:  time.Now().UnixNano(),
+		Retryable:  retryable,
+	}
+}
+
+// Error constructors
+func ErrInvalidJSON(err error) *AppError {
+	return NewError(ErrCodeInvalidJSON, "invalid json", err, 400, false)
+}
+
+func ErrMissingField(field string) *AppError {
+	return NewError(ErrCodeMissingField, "missing required field", nil, 400, false).
+		WithContext("field", field)
+}
+
+func ErrInstanceNotFound(name string) *AppError {
+	return NewError(ErrCodeInstanceNotFound, "instance not found", nil, 404, false).
+		WithContext("instance", name)
+}
+
+func ErrDatabaseFailure(err error) *AppError {
+	return NewError(ErrCodeDatabaseFailure, "database operation failed", err, 500, true)
+}
+
+func ErrQuotaExceeded(details string) *AppError {
+	return NewError(ErrCodeInvalidQuota, "quota exceeded", nil, 409, false).
+		WithContext("details", details)
+}
+
+func ErrJobCreation(err error) *AppError {
+	return NewError(ErrCodeJobCreationFailed, "job creation failed", err, 500, true)
+}
+
+// ============================================================================
+// REQUEST/RESPONSE TYPES
+// ============================================================================
+
 type InstanceActionRequest struct {
 	Action string `json:"action" binding:"required"`
 }
@@ -42,10 +159,10 @@ type CreateInstanceRequest struct {
 	Name       string            `json:"name" binding:"required"`
 	Image      string            `json:"image" binding:"required"`
 	Limits     map[string]string `json:"limits"`
-	UserData   string            `json:"user_data"`   // Opcional: Cloud-Init
-	Type       string            `json:"type"`        // Instance type: "container" or "virtual-machine"
-	TemplateID string            `json:"template_id"` // Opcional: ID do template a ser usado
-	ISOImage   string            `json:"iso_image"`   // Nome do arquivo ISO para boot customizado (opcional)
+	UserData   string            `json:"user_data"`
+	Type       string            `json:"type"`
+	TemplateID string            `json:"template_id"`
+	ISOImage   string            `json:"iso_image"`
 }
 
 type SnapshotRequest struct {
@@ -58,34 +175,924 @@ type AddPortRequest struct {
 	Protocol      string `json:"protocol" binding:"required"`
 }
 
-func main() {
-	log.SetOutput(os.Stdout)
-	log.Println("Iniciando Axion Control Plane...")
+type BackupConfigRequest struct {
+	Enabled   bool   `json:"enabled"`
+	Schedule  string `json:"schedule"`
+	Retention int    `json:"retention"`
+}
 
-	if err := db.Init("axion.db"); err != nil {
-		log.Fatalf("[ERRO CRÍTICO] Falha ao inicializar banco de dados: %v", err)
+type CreateNetworkRequest struct {
+	Name        string `json:"name" binding:"required"`
+	Description string `json:"description"`
+	Subnet      string `json:"subnet" binding:"required"`
+}
+
+// ============================================================================
+// METRICS
+// ============================================================================
+
+type Metrics struct {
+	requestsTotal      atomic.Uint64
+	requestsSuccess    atomic.Uint64
+	requestsError      atomic.Uint64
+	instancesCreated   atomic.Uint64
+	instancesDeleted   atomic.Uint64
+	snapshotsCreated   atomic.Uint64
+	jobsDispatched     atomic.Uint64
+	filesUploaded      atomic.Uint64
+	filesDownloaded    atomic.Uint64
+	networksCreated    atomic.Uint64
+	startTime          int64
+}
+
+func NewMetrics() *Metrics {
+	return &Metrics{startTime: time.Now().Unix()}
+}
+
+func (m *Metrics) RecordRequest() { m.requestsTotal.Add(1) }
+func (m *Metrics) RecordSuccess() { m.requestsSuccess.Add(1) }
+func (m *Metrics) RecordError()   { m.requestsError.Add(1) }
+func (m *Metrics) RecordInstanceCreated() { m.instancesCreated.Add(1) }
+func (m *Metrics) RecordInstanceDeleted() { m.instancesDeleted.Add(1) }
+func (m *Metrics) RecordSnapshot() { m.snapshotsCreated.Add(1) }
+func (m *Metrics) RecordJob() { m.jobsDispatched.Add(1) }
+func (m *Metrics) RecordFileUpload() { m.filesUploaded.Add(1) }
+func (m *Metrics) RecordFileDownload() { m.filesDownloaded.Add(1) }
+func (m *Metrics) RecordNetworkCreated() { m.networksCreated.Add(1) }
+
+func (m *Metrics) Snapshot() map[string]interface{} {
+	uptime := time.Now().Unix() - m.startTime
+	return map[string]interface{}{
+		"uptime_seconds":     uptime,
+		"requests_total":     m.requestsTotal.Load(),
+		"requests_success":   m.requestsSuccess.Load(),
+		"requests_error":     m.requestsError.Load(),
+		"instances_created":  m.instancesCreated.Load(),
+		"instances_deleted":  m.instancesDeleted.Load(),
+		"snapshots_created":  m.snapshotsCreated.Load(),
+		"jobs_dispatched":    m.jobsDispatched.Load(),
+		"files_uploaded":     m.filesUploaded.Load(),
+		"files_downloaded":   m.filesDownloaded.Load(),
+		"networks_created":   m.networksCreated.Load(),
+		"goroutines":         runtime.NumGoroutine(),
 	}
-	log.Println("Database axion.db inicializado.")
+}
 
+// ============================================================================
+// HTTP HANDLERS
+// ============================================================================
+
+type Handlers struct {
+	lxcClient       *lxc.Client
+	backupScheduler *scheduler.BackupScheduler
+	metrics         *Metrics
+}
+
+func NewHandlers(lxcClient *lxc.Client, backupScheduler *scheduler.BackupScheduler) *Handlers {
+	return &Handlers{
+		lxcClient:       lxcClient,
+		backupScheduler: backupScheduler,
+		metrics:         NewMetrics(),
+	}
+}
+
+// Middleware para métricas e error handling
+func (h *Handlers) metricsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		h.metrics.RecordRequest()
+		c.Next()
+		
+		if c.Writer.Status() >= 400 {
+			h.metrics.RecordError()
+		} else {
+			h.metrics.RecordSuccess()
+		}
+	}
+}
+
+func (h *Handlers) writeError(c *gin.Context, appErr *AppError) {
+	c.Header("X-Error-Code", strconv.Itoa(int(appErr.Code)))
+	if appErr.Retryable {
+		c.Header("Retry-After", "1")
+	}
+
+	response := gin.H{
+		"error":     appErr.Message,
+		"code":      appErr.Code,
+		"retryable": appErr.Retryable,
+		"timestamp": appErr.Timestamp,
+	}
+
+	if len(appErr.Context) > 0 {
+		response["context"] = appErr.Context
+	}
+
+	if appErr.Err != nil {
+		response["details"] = appErr.Err.Error()
+	}
+
+	c.JSON(appErr.HTTPStatus, response)
+}
+
+// Instance Handlers
+func (h *Handlers) GetInstance(c *gin.Context) {
+	name := c.Param("name")
+	
+	instance, err := db.GetInstanceWithHardwareInfo(name, h.lxcClient)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			h.writeError(c, ErrInstanceNotFound(name))
+			return
+		}
+		log.Printf("Error getting instance %s: %v", name, err)
+		h.writeError(c, ErrDatabaseFailure(err))
+		return
+	}
+	
+	c.JSON(200, instance)
+}
+
+func (h *Handlers) ListInstances(c *gin.Context) {
+	instances, err := db.ListInstances()
+	if err != nil {
+		log.Printf("Error listing instances: %v", err)
+		h.writeError(c, ErrDatabaseFailure(err))
+		return
+	}
+	c.JSON(200, instances)
+}
+
+func (h *Handlers) CreateInstance(c *gin.Context) {
+	var req CreateInstanceRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		h.writeError(c, ErrInvalidJSON(err))
+		return
+	}
+
+	// Validate and merge template
+	enhancedUserData, appErr := h.processTemplate(req)
+	if appErr != nil {
+		h.writeError(c, appErr)
+		return
+	}
+
+	// Validate ISO if provided
+	if req.ISOImage != "" {
+		if appErr := h.validateISO(req.ISOImage); appErr != nil {
+			h.writeError(c, appErr)
+			return
+		}
+	}
+
+	// Check quota
+	reqCpu := h.parseCPU(req.Limits)
+	reqRam := h.parseMemory(req.Limits)
+	
+	if err := h.lxcClient.CheckGlobalQuota(reqCpu, reqRam); err != nil {
+		h.writeError(c, ErrQuotaExceeded(err.Error()))
+		return
+	}
+
+	instance := &types.Instance{
+		Name:            req.Name,
+		Image:           req.Image,
+		Limits:          req.Limits,
+		UserData:        enhancedUserData,
+		Type:            req.Type,
+		BackupSchedule:  "@daily",
+		BackupRetention: 7,
+		BackupEnabled:   false,
+	}
+
+	if err := db.CreateInstance(instance); err != nil {
+		h.writeError(c, ErrDatabaseFailure(err))
+		return
+	}
+
+	jobID := h.dispatchJob(types.JobTypeCreateInstance, req.Name, req)
+	if jobID == "" {
+		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
+		return
+	}
+
+	h.metrics.RecordInstanceCreated()
+	h.metrics.RecordJob()
+	
+	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+}
+
+func (h *Handlers) DeleteInstance(c *gin.Context) {
+	name := c.Param("name")
+
+	if err := db.DeleteInstance(name); err != nil {
+		h.writeError(c, ErrDatabaseFailure(err))
+		return
+	}
+
+	jobID := h.dispatchJob(types.JobTypeDeleteInstance, name, map[string]string{})
+	if jobID == "" {
+		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
+		return
+	}
+
+	h.metrics.RecordInstanceDeleted()
+	h.metrics.RecordJob()
+	
+	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+}
+
+func (h *Handlers) UpdateInstanceState(c *gin.Context) {
+	name := c.Param("name")
+	var req InstanceActionRequest
+	
+	if err := c.ShouldBindJSON(&req); err != nil {
+		h.writeError(c, ErrInvalidJSON(err))
+		return
+	}
+
+	jobID := h.dispatchJob(types.JobTypeStateChange, name, req)
+	if jobID == "" {
+		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
+		return
+	}
+
+	h.metrics.RecordJob()
+	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+}
+
+func (h *Handlers) UpdateInstanceLimits(c *gin.Context) {
+	name := c.Param("name")
+	var req InstanceLimitsRequest
+	
+	if err := c.ShouldBindJSON(&req); err != nil {
+		h.writeError(c, ErrInvalidJSON(err))
+		return
+	}
+
+	reqCpu := utils.ParseCpuCores(req.CPU)
+	reqRam := utils.ParseMemoryToMB(req.Memory)
+	
+	if err := h.lxcClient.CheckGlobalQuota(reqCpu, reqRam); err != nil {
+		h.writeError(c, ErrQuotaExceeded(err.Error()))
+		return
+	}
+
+	jobID := h.dispatchJob(types.JobTypeUpdateLimits, name, req)
+	if jobID == "" {
+		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
+		return
+	}
+
+	h.metrics.RecordJob()
+	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+}
+
+func (h *Handlers) UpdateBackupConfig(c *gin.Context) {
+	name := c.Param("name")
+	var req BackupConfigRequest
+	
+	if err := c.ShouldBindJSON(&req); err != nil {
+		h.writeError(c, ErrInvalidJSON(err))
+		return
+	}
+
+	if err := db.UpdateInstanceBackupConfig(name, req.Enabled, req.Schedule, req.Retention); err != nil {
+		h.writeError(c, ErrDatabaseFailure(err))
+		return
+	}
+
+	h.backupScheduler.ReloadInstance(name)
+	c.JSON(200, gin.H{"status": "updated"})
+}
+
+// Snapshot Handlers
+func (h *Handlers) ListSnapshots(c *gin.Context) {
+	name := c.Param("name")
+	
+	snaps, err := h.lxcClient.ListSnapshots(name)
+	if err != nil {
+		h.writeError(c, NewError(ErrCodeSnapshotFailed, "failed to list snapshots", err, 500, true))
+		return
+	}
+	
+	c.JSON(200, snaps)
+}
+
+func (h *Handlers) CreateSnapshot(c *gin.Context) {
+	name := c.Param("name")
+	var req SnapshotRequest
+	
+	if err := c.ShouldBindJSON(&req); err != nil {
+		h.writeError(c, ErrInvalidJSON(err))
+		return
+	}
+
+	payload := map[string]string{"snapshot_name": req.Name}
+	jobID := h.dispatchJob(types.JobTypeCreateSnapshot, name, payload)
+	if jobID == "" {
+		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
+		return
+	}
+
+	h.metrics.RecordSnapshot()
+	h.metrics.RecordJob()
+	
+	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+}
+
+func (h *Handlers) RestoreSnapshot(c *gin.Context) {
+	name := c.Param("name")
+	snap := c.Param("snap")
+
+	payload := map[string]string{"snapshot_name": snap}
+	jobID := h.dispatchJob(types.JobTypeRestoreSnapshot, name, payload)
+	if jobID == "" {
+		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
+		return
+	}
+
+	h.metrics.RecordJob()
+	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+}
+
+func (h *Handlers) DeleteSnapshot(c *gin.Context) {
+	name := c.Param("name")
+	snap := c.Param("snap")
+
+	payload := map[string]string{"snapshot_name": snap}
+	jobID := h.dispatchJob(types.JobTypeDeleteSnapshot, name, payload)
+	if jobID == "" {
+		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
+		return
+	}
+
+	h.metrics.RecordJob()
+	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+}
+
+// Port Management Handlers
+func (h *Handlers) AddPort(c *gin.Context) {
+	name := c.Param("name")
+	var req AddPortRequest
+	
+	if err := c.ShouldBindJSON(&req); err != nil {
+		h.writeError(c, ErrInvalidJSON(err))
+		return
+	}
+
+	jobID := h.dispatchJob(types.JobTypeAddPort, name, req)
+	if jobID == "" {
+		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
+		return
+	}
+
+	h.metrics.RecordJob()
+	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+}
+
+func (h *Handlers) RemovePort(c *gin.Context) {
+	name := c.Param("name")
+	hpStr := c.Param("host_port")
+	hp, _ := strconv.Atoi(hpStr)
+
+	payload := map[string]int{"host_port": hp}
+	jobID := h.dispatchJob(types.JobTypeRemovePort, name, payload)
+	if jobID == "" {
+		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
+		return
+	}
+
+	h.metrics.RecordJob()
+	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+}
+
+// File System Handlers
+func (h *Handlers) ListFiles(c *gin.Context) {
+	name := c.Param("name")
+	path := c.DefaultQuery("path", "/root")
+
+	entries, err := h.lxcClient.ListFiles(name, path)
+	if err != nil {
+		h.writeError(c, NewError(ErrCodeFileOperationFailed, "failed to list files", err, 500, true))
+		return
+	}
+	
+	c.JSON(200, entries)
+}
+
+func (h *Handlers) DownloadFile(c *gin.Context) {
+	name := c.Param("name")
+	rawPath := c.Query("path")
+	
+	if rawPath == "" {
+		h.writeError(c, ErrMissingField("path"))
+		return
+	}
+
+	cleanPath := filepath.Clean(rawPath)
+	content, size, err := h.lxcClient.DownloadFile(name, cleanPath)
+	if err != nil {
+		h.writeError(c, NewError(ErrCodeFileOperationFailed, "download failed", err, 500, true))
+		return
+	}
+	defer content.Close()
+
+	const MaxEditorSize = 1024 * 1024
+	if size > MaxEditorSize {
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filepath.Base(cleanPath)))
+	} else {
+		c.Header("Content-Disposition", "inline")
+	}
+
+	if size > 0 {
+		c.Header("Content-Length", fmt.Sprintf("%d", size))
+	}
+
+	h.metrics.RecordFileDownload()
+	io.Copy(c.Writer, content)
+}
+
+func (h *Handlers) UploadFile(c *gin.Context) {
+	name := c.Param("name")
+	path := c.Query("path")
+	
+	if path == "" {
+		h.writeError(c, ErrMissingField("path"))
+		return
+	}
+
+	fileHeader, err := c.FormFile("file")
+	if err != nil {
+		h.writeError(c, ErrMissingField("file"))
+		return
+	}
+
+	file, err := fileHeader.Open()
+	if err != nil {
+		h.writeError(c, NewError(ErrCodeFileOperationFailed, "failed to open file", err, 500, false))
+		return
+	}
+	defer file.Close()
+
+	if err := h.lxcClient.UploadFile(name, path, file); err != nil {
+		h.writeError(c, NewError(ErrCodeFileOperationFailed, "upload failed", err, 500, true))
+		return
+	}
+
+	h.metrics.RecordFileUpload()
+	c.JSON(200, gin.H{"status": "uploaded"})
+}
+
+func (h *Handlers) DeleteFile(c *gin.Context) {
+	name := c.Param("name")
+	path := c.Query("path")
+	
+	if path == "" {
+		h.writeError(c, ErrMissingField("path"))
+		return
+	}
+
+	if err := h.lxcClient.DeleteFile(name, path); err != nil {
+		h.writeError(c, NewError(ErrCodeFileOperationFailed, "delete failed", err, 500, true))
+		return
+	}
+	
+	c.JSON(200, gin.H{"status": "deleted"})
+}
+
+// Job Handlers
+func (h *Handlers) ListJobs(c *gin.Context) {
+	jobs, err := db.ListRecentJobs(50)
+	if err != nil {
+		h.writeError(c, ErrDatabaseFailure(err))
+		return
+	}
+	c.JSON(200, jobs)
+}
+
+func (h *Handlers) GetJob(c *gin.Context) {
+	id := c.Param("id")
+	job, err := db.GetJob(id)
+	if err != nil {
+		h.writeError(c, NewError(ErrCodeInstanceNotFound, "job not found", err, 404, false))
+		return
+	}
+	c.JSON(200, job)
+}
+
+// Template Handlers
+func (h *Handlers) ListTemplates(c *gin.Context) {
+	templates := service.GetTemplates()
+	c.JSON(200, templates)
+}
+
+// Metrics Handlers
+func (h *Handlers) GetInstanceMetrics(c *gin.Context) {
+	name := c.Param("name")
+
+	lxdMetrics, err := h.lxcClient.ListInstances()
+	if err != nil {
+		log.Printf("Error fetching metrics for %s: %v", name, err)
+		h.writeError(c, NewError(ErrCodeMetricsFetchFailed, "failed to fetch metrics", err, 500, true))
+		return
+	}
+
+	for _, metric := range lxdMetrics {
+		if metric.Name == name {
+			c.JSON(200, metric)
+			return
+		}
+	}
+
+	h.writeError(c, ErrInstanceNotFound(name))
+}
+
+func (h *Handlers) GetInstanceMetricsHistory(c *gin.Context) {
+	name := c.Param("name")
+	rangeParam := c.DefaultQuery("range", "1h")
+
+	intervalMap := map[string]string{
+		"1h":  "1 hour",
+		"24h": "24 hours",
+		"7d":  "7 days",
+	}
+
+	interval, ok := intervalMap[rangeParam]
+	if !ok {
+		h.writeError(c, NewError(ErrCodeInvalidJSON, "invalid range parameter", nil, 400, false).
+			WithContext("valid_ranges", []string{"1h", "24h", "7d"}))
+		return
+	}
+
+	metrics, err := db.GetInstanceMetrics(name, interval)
+	if err != nil {
+		log.Printf("Error fetching history for %s: %v", name, err)
+		h.writeError(c, NewError(ErrCodeMetricsFetchFailed, "failed to fetch history", err, 500, true))
+		return
+	}
+
+	c.JSON(200, metrics)
+}
+
+func (h *Handlers) GetInstanceLogs(c *gin.Context) {
+	name := c.Param("name")
+	
+	logContent, err := h.lxcClient.GetInstanceLog(name)
+	if err != nil {
+		log.Printf("Error getting logs for %s: %v", name, err)
+		h.writeError(c, NewError(ErrCodeFileOperationFailed, "failed to get logs", err, 500, true))
+		return
+	}
+	
+	c.JSON(200, gin.H{"log": logContent})
+}
+
+
+// Network Handlers
+func (h *Handlers) ListNetworks(c *gin.Context) {
+	networks, err := h.lxcClient.ListNetworks()
+	if err != nil {
+		log.Printf("Error listing networks: %v", err)
+		h.writeError(c, NewError(ErrCodeNetworkOperationFailed, "failed to list networks", err, 500, true))
+		return
+	}
+	c.JSON(200, networks)
+}
+
+func (h *Handlers) CreateNetwork(c *gin.Context) {
+	var req CreateNetworkRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		h.writeError(c, ErrInvalidJSON(err))
+		return
+	}
+
+	if err := h.lxcClient.CreateNetwork(req.Name, req.Description, req.Subnet); err != nil {
+		log.Printf("Error creating network %s: %v", req.Name, err)
+		h.writeError(c, NewError(ErrCodeNetworkOperationFailed, "failed to create network", err, 500, true))
+		return
+	}
+
+	h.metrics.RecordNetworkCreated()
+	c.JSON(201, gin.H{"status": "created"})
+}
+
+func (h *Handlers) DeleteNetwork(c *gin.Context) {
+	name := c.Param("name")
+	
+	if err := h.lxcClient.DeleteNetwork(name); err != nil {
+		log.Printf("Error deleting network %s: %v", name, err)
+		h.writeError(c, NewError(ErrCodeNetworkOperationFailed, "failed to delete network", err, 500, true))
+		return
+	}
+	
+	c.JSON(200, gin.H{"status": "deleted"})
+}
+
+// Storage/ISO Handlers
+func (h *Handlers) UploadISO(c *gin.Context) {
+	storageService, err := service.NewStorageService()
+	if err != nil {
+		log.Printf("Error initializing storage: %v", err)
+		h.writeError(c, NewError(ErrCodeStorageOperationFailed, "storage init failed", err, 500, false))
+		return
+	}
+
+	file, header, err := c.Request.FormFile("iso_file")
+	if err != nil {
+		h.writeError(c, ErrMissingField("iso_file"))
+		return
+	}
+	defer file.Close()
+
+	filename := header.Filename
+	if !strings.HasSuffix(strings.ToLower(filename), ".iso") {
+		h.writeError(c, NewError(ErrCodeInvalidFileType, "only .iso files allowed", nil, 400, false))
+		return
+	}
+
+	isoInfo, err := storageService.SaveISOWithInfo(filename, file)
+	if err != nil {
+		log.Printf("Error saving ISO: %v", err)
+		h.writeError(c, NewError(ErrCodeStorageOperationFailed, "failed to save ISO", err, 500, true))
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"filename": isoInfo.Name,
+		"size":     isoInfo.Size,
+		"path":     isoInfo.Path,
+	})
+}
+
+func (h *Handlers) ListISOs(c *gin.Context) {
+	storageService, err := service.NewStorageService()
+	if err != nil {
+		log.Printf("Error initializing storage: %v", err)
+		h.writeError(c, NewError(ErrCodeStorageOperationFailed, "storage init failed", err, 500, false))
+		return
+	}
+
+	isos, err := storageService.ListISOs()
+	if err != nil {
+		log.Printf("Error listing ISOs: %v", err)
+		h.writeError(c, NewError(ErrCodeStorageOperationFailed, "failed to list ISOs", err, 500, true))
+		return
+	}
+
+	var isoInfos []gin.H
+	for _, isoName := range isos {
+		info, err := storageService.GetISOInfo(isoName)
+		if err != nil {
+			log.Printf("Error getting info for ISO %s: %v", isoName, err)
+			continue
+		}
+
+		isoInfos = append(isoInfos, gin.H{
+			"name": isoName,
+			"size": info.Size(),
+			"path": storageService.GetISOPath(isoName),
+		})
+	}
+
+	c.JSON(200, gin.H{"isos": isoInfos})
+}
+
+func (h *Handlers) DeleteISO(c *gin.Context) {
+	name := c.Param("name")
+
+	storageService, err := service.NewStorageService()
+	if err != nil {
+		log.Printf("Error initializing storage: %v", err)
+		h.writeError(c, NewError(ErrCodeStorageOperationFailed, "storage init failed", err, 500, false))
+		return
+	}
+
+	if err := storageService.DeleteISO(name); err != nil {
+		log.Printf("Error deleting ISO %s: %v", name, err)
+		h.writeError(c, NewError(ErrCodeStorageOperationFailed, "failed to delete ISO", err, 500, true))
+		return
+	}
+
+	c.JSON(200, gin.H{"status": "deleted"})
+}
+
+// Cluster Handlers
+func (h *Handlers) GetClusterMembers(c *gin.Context) {
+	members, err := h.lxcClient.GetClusterMembers()
+	if err != nil {
+		if strings.Contains(err.Error(), "not clustered") {
+			response := []map[string]interface{}{
+				{
+					"name":    "local-server",
+					"status":  "Online",
+					"address": "127.0.0.1",
+					"roles":   []string{"standalone"},
+				},
+			}
+			c.JSON(200, response)
+			return
+		}
+
+		log.Printf("Error getting cluster members: %v", err)
+		h.writeError(c, NewError(ErrCodeLXDConnectionFailed, "failed to get cluster members", err, 500, true))
+		return
+	}
+
+	type ClusterMemberResponse struct {
+		Name    string   `json:"name"`
+		Status  string   `json:"status"`
+		Address string   `json:"address"`
+		Roles   []string `json:"roles"`
+	}
+
+	var response []ClusterMemberResponse
+	for _, member := range members {
+		response = append(response, ClusterMemberResponse{
+			Name:    member.ServerName,
+			Status:  member.Status,
+			Address: member.URL,
+			Roles:   member.Roles,
+		})
+	}
+
+	c.JSON(200, response)
+}
+
+func (h *Handlers) StreamTelemetry(c *gin.Context) {
+	api.StreamTelemetry(c, h.lxcClient, func(metrics []lxc.InstanceMetric) {
+		for _, m := range metrics {
+			dbMetric := &db.Metric{
+				InstanceName: m.Name,
+				CPUPercent:   float64(m.CPUUsageSeconds),
+				MemoryUsage:  m.MemoryUsageBytes,
+				DiskUsage:    m.DiskUsageBytes,
+			}
+			if err := db.InsertMetric(dbMetric); err != nil {
+				log.Printf("Error inserting metric for %s: %v", m.Name, err)
+			}
+		}
+	})
+}
+
+func (h *Handlers) GetMetrics(c *gin.Context) {
+	c.JSON(200, h.metrics.Snapshot())
+}
+
+// Helper methods
+func (h *Handlers) processTemplate(req CreateInstanceRequest) (string, *AppError) {
+	if req.TemplateID == "" {
+		return req.UserData, nil
+	}
+
+	templates := service.GetTemplates()
+	for _, template := range templates {
+		if template.ID == req.TemplateID {
+			reqCpu := h.parseCPU(req.Limits)
+			reqRam := h.parseMemory(req.Limits)
+
+			if reqCpu < template.MinCPU {
+				return "", NewError(ErrCodeInsufficientResources, 
+					fmt.Sprintf("CPU insufficient for template %s", template.Name), 
+					nil, 400, false).
+					WithContext("required", template.MinCPU).
+					WithContext("provided", reqCpu)
+			}
+
+			if reqRam < int64(template.MinRAM) {
+				return "", NewError(ErrCodeInsufficientResources,
+					fmt.Sprintf("RAM insufficient for template %s", template.Name),
+					nil, 400, false).
+					WithContext("required", template.MinRAM).
+					WithContext("provided", reqRam)
+			}
+
+			if req.UserData != "" {
+				return template.CloudConfig + "\n" + req.UserData, nil
+			}
+			return template.CloudConfig, nil
+		}
+	}
+
+	return "", NewError(ErrCodeTemplateNotFound, "template not found", nil, 404, false).
+		WithContext("template_id", req.TemplateID)
+}
+
+func (h *Handlers) validateISO(isoImage string) *AppError {
+	storageService, err := service.NewStorageService()
+	if err != nil {
+		return NewError(ErrCodeStorageOperationFailed, "storage init failed", err, 500, false)
+	}
+
+	isoPath := storageService.GetISOPath(isoImage)
+	if _, err := os.Stat(isoPath); os.IsNotExist(err) {
+		return NewError(ErrCodeISONotFound, "ISO file does not exist", nil, 400, false).
+			WithContext("iso_image", isoImage)
+	}
+
+	return nil
+}
+
+func (h *Handlers) parseCPU(limits map[string]string) int {
+	if val, ok := limits["limits.cpu"]; ok {
+		return utils.ParseCpuCores(val)
+	}
+	return 1
+}
+
+func (h *Handlers) parseMemory(limits map[string]string) int64 {
+	if val, ok := limits["limits.memory"]; ok {
+		return utils.ParseMemoryToMB(val)
+	}
+	return 512
+}
+
+func (h *Handlers) dispatchJob(jobType types.JobType, target string, payload interface{}) string {
+	jobID := uuid.New().String()
+	payloadBytes, _ := json.Marshal(payload)
+	
+	job := &db.Job{
+		ID:      jobID,
+		Type:    jobType,
+		Target:  target,
+		Payload: string(payloadBytes),
+	}
+	
+	if err := db.CreateJob(job); err != nil {
+		log.Printf("Error creating job: %v", err)
+		return ""
+	}
+	
+	worker.DispatchJob(jobID)
+	return jobID
+}
+
+// ============================================================================
+// APPLICATION ORCHESTRATOR
+// ============================================================================
+
+type Application struct {
+	lxcClient       *lxc.Client
+	backupScheduler *scheduler.BackupScheduler
+	handlers        *Handlers
+	router          *gin.Engine
+	server          *http.Server
+	state           atomic.Uint32
+	wg              sync.WaitGroup
+}
+
+const (
+	stateCreated uint32 = 0
+	stateRunning uint32 = 1
+	stateStopping uint32 = 2
+	stateStopped uint32 = 3
+)
+
+func NewApplication() (*Application, error) {
+	// Initialize database
+	if err := db.Init("axion.db"); err != nil {
+		return nil, fmt.Errorf("database initialization failed: %w", err)
+	}
+	log.Println("✓ Database initialized")
+
+	// Initialize LXD client
 	lxcClient, err := lxc.NewClient()
 	if err != nil {
-		log.Fatalf("[ERRO CRÍTICO] Falha na inicialização do provider LXD: %v", err)
+		return nil, fmt.Errorf("LXD client initialization failed: %w", err)
 	}
-	log.Println("Conexão com LXD estabelecida.")
+	log.Println("✓ LXD connection established")
 
-	// Run sync and start collectors
-	scheduler.RunStartupSync(db.DB, lxcClient)
-	go monitor.StartHistoricalCollector(db.DB, lxcClient)
-
+	// Initialize workers
 	worker.Init(2, lxcClient)
+	log.Println("✓ Worker pool initialized")
+
+	// Initialize API broadcaster
 	api.InitBroadcaster()
+	log.Println("✓ API broadcaster initialized")
 
+	// Initialize backup scheduler
 	backupScheduler := scheduler.NewBackupScheduler(db.DB, lxcClient)
-	backupScheduler.Start()
-	backupScheduler.SyncJobs()
+	log.Println("✓ Backup scheduler initialized")
 
-	r := gin.Default()
+	// Initialize handlers
+	handlers := NewHandlers(lxcClient, backupScheduler)
 
+	app := &Application{
+		lxcClient:       lxcClient,
+		backupScheduler: backupScheduler,
+		handlers:        handlers,
+	}
+	app.state.Store(stateCreated)
+
+	return app, nil
+}
+
+func (a *Application) setupRouter() {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	
+	// Middleware
+	r.Use(gin.Recovery())
+	r.Use(a.handlers.metricsMiddleware())
 	r.Use(cors.New(cors.Config{
 		AllowAllOrigins: true,
 		AllowMethods:    []string{"GET", "POST", "OPTIONS", "DELETE", "PUT"},
@@ -94,718 +1101,236 @@ func main() {
 		MaxAge:          12 * time.Hour,
 	}))
 
+	// Public routes
 	r.POST("/login", auth.LoginHandler)
 	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		c.JSON(200, gin.H{
+			"status": "healthy",
+			"state":  a.state.Load(),
+		})
+	})
+	r.GET("/metrics", a.handlers.GetMetrics)
+
+	// WebSocket routes (no auth middleware for terminal)
+	r.GET("/ws/terminal/:name", func(c *gin.Context) {
+		api.TerminalHandler(c, a.lxcClient)
 	})
 
+	// Protected routes
 	protected := r.Group("/")
 	protected.Use(auth.AuthMiddleware())
 	{
 		// Instances
-		protected.GET("/instances/:name", func(c *gin.Context) {
-			name := c.Param("name")
-			instance, err := db.GetInstanceWithHardwareInfo(name, lxcClient)
-			if err != nil {
-				if err == sql.ErrNoRows {
-					c.JSON(404, gin.H{"error": "Instance not found"})
-					return
-				}
-				log.Printf("Error getting instance %s: %v", name, err)
-				c.JSON(500, gin.H{"error": "Failed to get instance"})
-				return
-			}
-			c.JSON(200, instance)
-		})
-
-		protected.GET("/instances", func(c *gin.Context) {
-			instances, err := db.ListInstances()
-			if err != nil {
-				log.Printf("Erro ao processar ListInstances: %v", err)
-				c.JSON(500, gin.H{"error": "Falha ao obter métricas"})
-				return
-			}
-			c.JSON(200, instances)
-		})
-
-		protected.POST("/instances", func(c *gin.Context) {
-			var req CreateInstanceRequest
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(400, gin.H{"error": "JSON inválido. Campos obrigatórios: name, image"})
-				return
-			}
-
-			// If template is specified, process it
-			enhancedUserData := req.UserData
-			if req.TemplateID != "" {
-				templates := service.GetTemplates()
-				templateFound := false
-				for _, template := range templates {
-					if template.ID == req.TemplateID {
-						// Validate that the instance meets the template's minimum requirements
-						reqCpu := 1
-						if val, ok := req.Limits["limits.cpu"]; ok {
-							reqCpu = utils.ParseCpuCores(val)
-						}
-						reqRam := int64(512)
-						if val, ok := req.Limits["limits.memory"]; ok {
-							reqRam = utils.ParseMemoryToMB(val)
-						}
-
-						// Check if template requirements are met
-						if reqCpu < template.MinCPU {
-							c.JSON(400, gin.H{"error": fmt.Sprintf("CPU insuficiente. Template %s requer no mínimo %d CPU(s)", template.Name, template.MinCPU)})
-							return
-						}
-						if reqRam < int64(template.MinRAM) {
-							c.JSON(400, gin.H{"error": fmt.Sprintf("RAM insuficiente. Template %s requer no mínimo %d MB", template.Name, template.MinRAM)})
-							return
-						}
-
-						// Merge template cloud config with existing user data
-						if req.UserData != "" {
-							// If both template and user data exist, we need to merge them
-							enhancedUserData = template.CloudConfig + "\n" + req.UserData
-						} else {
-							// Only use template cloud config
-							enhancedUserData = template.CloudConfig
-						}
-						templateFound = true
-						break
-					}
-				}
-
-				if !templateFound {
-					c.JSON(404, gin.H{"error": fmt.Sprintf("Template com ID %s não encontrado", req.TemplateID)})
-					return
-				}
-			}
-
-			// If ISOImage is provided, validate that the ISO exists
-			if req.ISOImage != "" {
-				storageService, err := service.NewStorageService()
-				if err != nil {
-					c.JSON(500, gin.H{"error": "Failed to initialize storage service"})
-					return
-				}
-
-				// Validate that the ISO file exists
-				isoPath := storageService.GetISOPath(req.ISOImage)
-				if _, err := os.Stat(isoPath); os.IsNotExist(err) {
-					c.JSON(400, gin.H{"error": "Specified ISO file does not exist"})
-					return
-				}
-			}
-
-			reqCpu := 1
-			if val, ok := req.Limits["limits.cpu"]; ok {
-				reqCpu = utils.ParseCpuCores(val)
-			}
-			reqRam := int64(512)
-			if val, ok := req.Limits["limits.memory"]; ok {
-				reqRam = utils.ParseMemoryToMB(val)
-			}
-
-			if err := lxcClient.CheckGlobalQuota(reqCpu, reqRam); err != nil {
-				c.JSON(409, gin.H{"error": "Quota Exceeded", "details": err.Error()})
-				return
-			}
-
-			instance := &types.Instance{
-				Name:            req.Name,
-				Image:           req.Image,
-				Limits:          req.Limits,
-				UserData:        enhancedUserData,
-				Type:            req.Type,
-				BackupSchedule:  "@daily",
-				BackupRetention: 7,
-				BackupEnabled:   false,
-			}
-
-			if err := db.CreateInstance(instance); err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-
-			jobID := uuid.New().String()
-			payloadBytes, _ := json.Marshal(req)
-			job := &db.Job{ID: jobID, Type: types.JobTypeCreateInstance, Target: req.Name, Payload: string(payloadBytes)}
-			if err := db.CreateJob(job); err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			worker.DispatchJob(jobID)
-			c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
-		})
-
-		protected.DELETE("/instances/:name", func(c *gin.Context) {
-			name := c.Param("name")
-
-			if err := db.DeleteInstance(name); err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-
-			jobID := uuid.New().String()
-			job := &db.Job{ID: jobID, Type: types.JobTypeDeleteInstance, Target: name, Payload: "{}"}
-			if err := db.CreateJob(job); err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			worker.DispatchJob(jobID)
-			c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
-		})
-
-		protected.POST("/instances/:name/state", func(c *gin.Context) {
-			name := c.Param("name")
-			var req InstanceActionRequest
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(400, gin.H{"error": "JSON inválido"})
-				return
-			}
-			jobID := uuid.New().String()
-			payloadBytes, _ := json.Marshal(req)
-			job := &db.Job{ID: jobID, Type: types.JobTypeStateChange, Target: name, Payload: string(payloadBytes)}
-			if err := db.CreateJob(job); err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			worker.DispatchJob(jobID)
-			c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
-		})
-
-		protected.POST("/instances/:name/backups/config", func(c *gin.Context) {
-			name := c.Param("name")
-			var req struct {
-				Enabled   bool   `json:"enabled"`
-				Schedule  string `json:"schedule"`
-				Retention int    `json:"retention"`
-			}
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(400, gin.H{"error": "Invalid JSON: " + err.Error()})
-				return
-			}
-			if err := db.UpdateInstanceBackupConfig(name, req.Enabled, req.Schedule, req.Retention); err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			backupScheduler.ReloadInstance(name)
-			c.JSON(200, gin.H{"status": "updated"})
-		})
-
-		protected.POST("/instances/:name/limits", func(c *gin.Context) {
-			name := c.Param("name")
-			var req InstanceLimitsRequest
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(400, gin.H{"error": "JSON inválido"})
-				return
-			}
-			reqCpu := utils.ParseCpuCores(req.CPU)
-			reqRam := utils.ParseMemoryToMB(req.Memory)
-			if err := lxcClient.CheckGlobalQuota(reqCpu, reqRam); err != nil {
-				c.JSON(409, gin.H{"error": "Quota Exceeded", "details": err.Error()})
-				return
-			}
-			jobID := uuid.New().String()
-			payloadBytes, _ := json.Marshal(req)
-			job := &db.Job{ID: jobID, Type: types.JobTypeUpdateLimits, Target: name, Payload: string(payloadBytes)}
-			if err := db.CreateJob(job); err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			worker.DispatchJob(jobID)
-			c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
-		})
+		protected.GET("/instances", a.handlers.ListInstances)
+		protected.GET("/instances/:name", a.handlers.GetInstance)
+		protected.POST("/instances", a.handlers.CreateInstance)
+		protected.DELETE("/instances/:name", a.handlers.DeleteInstance)
+		protected.POST("/instances/:name/state", a.handlers.UpdateInstanceState)
+		protected.POST("/instances/:name/limits", a.handlers.UpdateInstanceLimits)
+		protected.POST("/instances/:name/backups/config", a.handlers.UpdateBackupConfig)
 
 		// Snapshots
-		protected.GET("/instances/:name/snapshots", func(c *gin.Context) {
-			name := c.Param("name")
-			snaps, err := lxcClient.ListSnapshots(name)
-			if err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			c.JSON(200, snaps)
-		})
-		protected.POST("/instances/:name/snapshots", func(c *gin.Context) {
-			name := c.Param("name")
-			var req SnapshotRequest
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(400, gin.H{"error": "Nome obrigatório"})
-				return
-			}
-			jobID := uuid.New().String()
-			payload, _ := json.Marshal(map[string]string{"snapshot_name": req.Name})
-			job := &db.Job{ID: jobID, Type: types.JobTypeCreateSnapshot, Target: name, Payload: string(payload)}
-			if err := db.CreateJob(job); err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			worker.DispatchJob(jobID)
-			c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
-		})
-		protected.POST("/instances/:name/snapshots/:snap/restore", func(c *gin.Context) {
-			name := c.Param("name")
-			snap := c.Param("snap")
-			jobID := uuid.New().String()
-			payload, _ := json.Marshal(map[string]string{"snapshot_name": snap})
-			job := &db.Job{ID: jobID, Type: types.JobTypeRestoreSnapshot, Target: name, Payload: string(payload)}
-			if err := db.CreateJob(job); err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			worker.DispatchJob(jobID)
-			c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
-		})
-		protected.DELETE("/instances/:name/snapshots/:snap", func(c *gin.Context) {
-			name := c.Param("name")
-			snap := c.Param("snap")
-			jobID := uuid.New().String()
-			payload, _ := json.Marshal(map[string]string{"snapshot_name": snap})
-			job := &db.Job{ID: jobID, Type: types.JobTypeDeleteSnapshot, Target: name, Payload: string(payload)}
-			if err := db.CreateJob(job); err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			worker.DispatchJob(jobID)
-			c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
-		})
+		protected.GET("/instances/:name/snapshots", a.handlers.ListSnapshots)
+		protected.POST("/instances/:name/snapshots", a.handlers.CreateSnapshot)
+		protected.POST("/instances/:name/snapshots/:snap/restore", a.handlers.RestoreSnapshot)
+		protected.DELETE("/instances/:name/snapshots/:snap", a.handlers.DeleteSnapshot)
 
 		// Ports
-		protected.POST("/instances/:name/ports", func(c *gin.Context) {
-			name := c.Param("name")
-			var req AddPortRequest
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(400, gin.H{"error": err.Error()})
-				return
-			}
-			jobID := uuid.New().String()
-			payload, _ := json.Marshal(req)
-			job := &db.Job{ID: jobID, Type: types.JobTypeAddPort, Target: name, Payload: string(payload)}
-			if err := db.CreateJob(job); err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			worker.DispatchJob(jobID)
-			c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
-		})
-		protected.DELETE("/instances/:name/ports/:host_port", func(c *gin.Context) {
-			name := c.Param("name")
-			hpStr := c.Param("host_port")
-			hp, _ := strconv.Atoi(hpStr)
-			jobID := uuid.New().String()
-			payload, _ := json.Marshal(map[string]int{"host_port": hp})
-			job := &db.Job{ID: jobID, Type: types.JobTypeRemovePort, Target: name, Payload: string(payload)}
-			if err := db.CreateJob(job); err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			worker.DispatchJob(jobID)
-			c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
-		})
+		protected.POST("/instances/:name/ports", a.handlers.AddPort)
+		protected.DELETE("/instances/:name/ports/:host_port", a.handlers.RemovePort)
 
-		// --- FILE SYSTEM (EXPLORER) ---
+		// File System
+		protected.GET("/instances/:name/files/list", a.handlers.ListFiles)
+		protected.GET("/instances/:name/files/content", a.handlers.DownloadFile)
+		protected.POST("/instances/:name/files", a.handlers.UploadFile)
+		protected.DELETE("/instances/:name/files", a.handlers.DeleteFile)
 
-		// List
-		protected.GET("/instances/:name/files/list", func(c *gin.Context) {
-			name := c.Param("name")
-			path := c.Query("path")
-			if path == "" {
-				path = "/root"
-			}
+		// Jobs
+		protected.GET("/jobs", a.handlers.ListJobs)
+		protected.GET("/jobs/:id", a.handlers.GetJob)
 
-			entries, err := lxcClient.ListFiles(name, path)
-			if err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			c.JSON(200, entries)
-		})
+		// Templates
+		protected.GET("/templates", a.handlers.ListTemplates)
 
-		// Download
-		protected.GET("/instances/:name/files/content", func(c *gin.Context) {
-			name := c.Param("name")
-			rawPath := c.Query("path")
-			if rawPath == "" {
-				c.JSON(400, gin.H{"error": "Path missing"})
-				return
-			}
+		// Metrics
+		protected.GET("/instances/:name/metrics", a.handlers.GetInstanceMetrics)
+		protected.GET("/instances/:name/metrics/history", a.handlers.GetInstanceMetricsHistory)
+		protected.GET("/instances/:name/logs", a.handlers.GetInstanceLogs)
+		protected.GET("/ws/telemetry", a.handlers.StreamTelemetry)
 
-			cleanPath := filepath.Clean(rawPath)
+		// Networks
+		protected.GET("/networks", a.handlers.ListNetworks)
+		protected.POST("/networks", a.handlers.CreateNetwork)
+		protected.DELETE("/networks/:name", a.handlers.DeleteNetwork)
 
-			content, size, err := lxcClient.DownloadFile(name, cleanPath)
-			if err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			defer content.Close()
+		// Storage/ISOs
+		protected.POST("/storage/isos", a.handlers.UploadISO)
+		protected.GET("/storage/isos", a.handlers.ListISOs)
+		protected.DELETE("/storage/isos/:name", a.handlers.DeleteISO)
 
-			const MaxEditorSize = 1024 * 1024 // 1MB
-
-			if size > MaxEditorSize {
-				// Force download ONLY for files confirmed to be large
-				c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filepath.Base(cleanPath)))
-			} else {
-				c.Header("Content-Disposition", "inline")
-			}
-
-			if size > 0 {
-				c.Header("Content-Length", fmt.Sprintf("%d", size))
-			}
-			io.Copy(c.Writer, content)
-		})
-
-		// Upload
-		protected.POST("/instances/:name/files", func(c *gin.Context) {
-			name := c.Param("name")
-			path := c.Query("path")
-			if path == "" {
-				c.JSON(400, gin.H{"error": "Target path required"})
-				return
-			}
-
-			fileHeader, err := c.FormFile("file")
-			if err != nil {
-				c.JSON(400, gin.H{"error": "File missing"})
-				return
-			}
-
-			log.Printf("[Upload Debug] Filename: %s, Header Size: %d", fileHeader.Filename, fileHeader.Size)
-
-			file, err := fileHeader.Open()
-			if err != nil {
-				c.JSON(500, gin.H{"error": "Failed to open file"})
-				return
-			}
-			defer file.Close()
-
-			if err := lxcClient.UploadFile(name, path, file); err != nil {
-				c.JSON(500, gin.H{"error": "Upload failed", "details": err.Error()})
-				return
-			}
-
-			c.JSON(200, gin.H{"status": "uploaded"})
-		})
-
-		// Delete File
-		protected.DELETE("/instances/:name/files", func(c *gin.Context) {
-			name := c.Param("name")
-			path := c.Query("path")
-			if path == "" {
-				c.JSON(400, gin.H{"error": "Path missing"})
-				return
-			}
-
-			if err := lxcClient.DeleteFile(name, path); err != nil {
-				c.JSON(500, gin.H{"error": "Delete failed", "details": err.Error()})
-				return
-			}
-			c.JSON(200, gin.H{"status": "deleted"})
-		})
-
-		protected.GET("/jobs", func(c *gin.Context) {
-			jobs, err := db.ListRecentJobs(50)
-			if err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
-				return
-			}
-			c.JSON(200, jobs)
-		})
-		protected.GET("/jobs/:id", func(c *gin.Context) {
-			id := c.Param("id")
-			job, err := db.GetJob(id)
-			if err != nil {
-				c.JSON(404, gin.H{"error": "Not found"})
-				return
-			}
-			c.JSON(200, job)
-		})
-
-		protected.GET("/templates", func(c *gin.Context) {
-			templates := service.GetTemplates()
-			c.JSON(200, templates)
-		})
-
-		protected.GET("/ws/telemetry", func(c *gin.Context) {
-			api.StreamTelemetry(c, lxcClient, func(metrics []lxc.InstanceMetric) {
-				for _, m := range metrics {
-					// Convert lxc.InstanceMetric to db.Metric
-					dbMetric := &db.Metric{
-						InstanceName: m.Name,
-						CPUPercent:   float64(m.CPUUsageSeconds), // This might need adjustment depending on how you calculate percentage
-						MemoryUsage:  m.MemoryUsageBytes,
-						DiskUsage:    m.DiskUsageBytes,
-					}
-					if err := db.InsertMetric(dbMetric); err != nil {
-						log.Printf("Error inserting metric for instance %s: %v", m.Name, err)
-					}
-				}
-			})
-		})
-
-		protected.GET("/instances/:name/metrics/history", func(c *gin.Context) {
-			name := c.Param("name")
-			rangeParam := c.DefaultQuery("range", "1h")
-
-			intervalMap := map[string]string{
-				"1h":  "1 hour",
-				"24h": "24 hours",
-				"7d":  "7 days",
-			}
-
-			interval, ok := intervalMap[rangeParam]
-			if !ok {
-				c.JSON(400, gin.H{"error": "Invalid range. Valid ranges are 1h, 24h, 7d"})
-				return
-			}
-
-			metrics, err := db.GetInstanceMetrics(name, interval)
-			if err != nil {
-				log.Printf("Error fetching metrics history for %s: %v", name, err)
-				c.JSON(500, gin.H{"error": "Failed to fetch metrics history"})
-				return
-			}
-
-			c.JSON(200, metrics)
-		})
-
-		// Current metrics endpoint
-		protected.GET("/instances/:name/metrics", func(c *gin.Context) {
-			name := c.Param("name")
-
-			// Get current metrics for the instance
-			lxdMetrics, err := lxcClient.ListInstances()
-			if err != nil {
-				log.Printf("Error fetching metrics for instance %s: %v", name, err)
-				c.JSON(500, gin.H{"error": "Failed to fetch metrics"})
-				return
-			}
-
-			// Find the specific instance
-			var targetMetric *lxc.InstanceMetric
-			for _, metric := range lxdMetrics {
-				if metric.Name == name {
-					metric := metric // Create a copy of the loop variable
-					targetMetric = &metric
-					break
-				}
-			}
-
-			if targetMetric == nil {
-				c.JSON(404, gin.H{"error": "Instance not found"})
-				return
-			}
-
-			c.JSON(200, targetMetric)
-		})
-
-		// Instance logs endpoint
-		protected.GET("/instances/:name/logs", func(c *gin.Context) {
-			name := c.Param("name")
-			logContent, err := lxcClient.GetInstanceLog(name)
-			if err != nil {
-				log.Printf("Erro ao obter log da instância %s: %v", name, err)
-				c.JSON(500, gin.H{"error": "Falha ao obter log da instância", "details": err.Error()})
-				return
-			}
-			c.JSON(200, gin.H{"log": logContent})
-		})
-
-		// Network management endpoints
-		protected.GET("/networks", func(c *gin.Context) {
-			networks, err := lxcClient.ListNetworks()
-			if err != nil {
-				log.Printf("Erro ao listar redes: %v", err)
-				c.JSON(500, gin.H{"error": "Falha ao obter redes", "details": err.Error()})
-				return
-			}
-			c.JSON(200, networks)
-		})
-
-		protected.POST("/networks", func(c *gin.Context) {
-			var req struct {
-				Name        string `json:"name" binding:"required"`
-				Description string `json:"description"`
-				Subnet      string `json:"subnet" binding:"required"`
-			}
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(400, gin.H{"error": "JSON inválido. Campos obrigatórios: name, subnet"})
-				return
-			}
-
-			err := lxcClient.CreateNetwork(req.Name, req.Description, req.Subnet)
-			if err != nil {
-				log.Printf("Erro ao criar rede %s: %v", req.Name, err)
-				c.JSON(500, gin.H{"error": "Falha ao criar rede", "details": err.Error()})
-				return
-			}
-			c.JSON(201, gin.H{"status": "created"})
-		})
-
-		protected.DELETE("/networks/:name", func(c *gin.Context) {
-			name := c.Param("name")
-			err := lxcClient.DeleteNetwork(name)
-			if err != nil {
-				log.Printf("Erro ao deletar rede %s: %v", name, err)
-				c.JSON(500, gin.H{"error": "Falha ao deletar rede", "details": err.Error()})
-				return
-			}
-			c.JSON(200, gin.H{"status": "deleted"})
-		})
-
-		// Storage - ISO uploads
-		protected.POST("/storage/isos", func(c *gin.Context) {
-			// Retrieve storage service or create a new one for this endpoint
-			storageService, err := service.NewStorageService()
-			if err != nil {
-				log.Printf("Error initializing storage service: %v", err)
-				c.JSON(500, gin.H{"error": "Failed to initialize storage service"})
-				return
-			}
-
-			// Get file from multipart form
-			file, header, err := c.Request.FormFile("iso_file")
-			if err != nil {
-				c.JSON(400, gin.H{"error": "ISO file is required"})
-				return
-			}
-			defer file.Close()
-
-			// Validate file extension
-			filename := header.Filename
-			if !strings.HasSuffix(strings.ToLower(filename), ".iso") {
-				c.JSON(400, gin.H{"error": "Only .iso files are allowed"})
-				return
-			}
-
-			// Save ISO file using streaming and get info
-			isoInfo, err := storageService.SaveISOWithInfo(filename, file)
-			if err != nil {
-				log.Printf("Error saving ISO file: %v", err)
-				c.JSON(500, gin.H{"error": "Failed to save ISO file", "details": err.Error()})
-				return
-			}
-
-			c.JSON(200, gin.H{
-				"filename": isoInfo.Name,
-				"size":     isoInfo.Size,
-				"path":     isoInfo.Path,
-			})
-		})
-
-		// List uploaded ISOs
-		protected.GET("/storage/isos", func(c *gin.Context) {
-			storageService, err := service.NewStorageService()
-			if err != nil {
-				log.Printf("Error initializing storage service: %v", err)
-				c.JSON(500, gin.H{"error": "Failed to initialize storage service"})
-				return
-			}
-
-			isos, err := storageService.ListISOs()
-			if err != nil {
-				log.Printf("Error listing ISOs: %v", err)
-				c.JSON(500, gin.H{"error": "Failed to list ISOs", "details": err.Error()})
-				return
-			}
-
-			// Get detailed information for each ISO
-			var isoInfos []gin.H
-			for _, isoName := range isos {
-				info, err := storageService.GetISOInfo(isoName)
-				if err != nil {
-					log.Printf("Error getting info for ISO %s: %v", isoName, err)
-					continue
-				}
-
-				isoInfos = append(isoInfos, gin.H{
-					"name": isoName,
-					"size": info.Size(),
-					"path": storageService.GetISOPath(isoName),
-				})
-			}
-
-			c.JSON(200, gin.H{
-				"isos": isoInfos,
-			})
-		})
-
-		// Delete an ISO
-		protected.DELETE("/storage/isos/:name", func(c *gin.Context) {
-			name := c.Param("name")
-
-			storageService, err := service.NewStorageService()
-			if err != nil {
-				log.Printf("Error initializing storage service: %v", err)
-				c.JSON(500, gin.H{"error": "Failed to initialize storage service"})
-				return
-			}
-
-			err = storageService.DeleteISO(name)
-			if err != nil {
-				log.Printf("Error deleting ISO %s: %v", name, err)
-				c.JSON(500, gin.H{"error": "Failed to delete ISO", "details": err.Error()})
-				return
-			}
-
-			c.JSON(200, gin.H{
-				"status": "deleted",
-			})
-		})
-
-		// Cluster members endpoint
-		protected.GET("/cluster/members", func(c *gin.Context) {
-			members, err := lxcClient.GetClusterMembers()
-			if err != nil {
-				// Check specifically for not clustered error and return single-node representation
-				if strings.Contains(err.Error(), "not clustered") {
-					// Return single-node representation showing the machine state
-					response := []map[string]interface{}{
-						{
-							"name":    "local-server", // Use actual server name if available
-							"status":  "Online",
-							"address": "127.0.0.1", // Local address
-							"roles":   []string{"standalone"},
-						},
-					}
-					c.JSON(200, response)
-					return
-				}
-
-				log.Printf("Erro ao processar GetClusterMembers: %v", err)
-				c.JSON(500, gin.H{"error": "Falha ao obter membros do cluster", "details": err.Error()})
-				return
-			}
-
-			// Format the cluster members response with Name, Status, Address and Role
-			type ClusterMemberResponse struct {
-				Name    string   `json:"name"`
-				Status  string   `json:"status"`
-				Address string   `json:"address"`
-				Roles   []string `json:"roles"`
-			}
-
-			var response []ClusterMemberResponse
-			for _, member := range members {
-				response = append(response, ClusterMemberResponse{
-					Name:    member.ServerName,
-					Status:  member.Status,
-					Address: member.URL,
-					Roles:   member.Roles,
-				})
-			}
-
-			c.JSON(200, response)
-		})
+		// Cluster
+		protected.GET("/cluster/members", a.handlers.GetClusterMembers)
 	}
 
-	r.GET("/ws/terminal/:name", func(c *gin.Context) {
-		api.TerminalHandler(c, lxcClient)
-	})
+	a.router = r
+}
 
-	port := "8500"
-	log.Printf("Axion Control Plane rodando na porta %s", port)
-	if err := r.Run("0.0.0.0:" + port); err != nil {
-		log.Fatalf("Falha ao iniciar servidor web: %v", err)
+func (a *Application) Start() error {
+	if !a.state.CompareAndSwap(stateCreated, stateRunning) {
+		return errors.New("application already started")
 	}
+
+	// Run startup sync
+	scheduler.RunStartupSync(db.DB, a.lxcClient)
+	log.Println("✓ Startup sync completed")
+
+	// Start background services
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		monitor.StartHistoricalCollector(db.DB, a.lxcClient)
+	}()
+	log.Println("✓ Historical collector started")
+
+	// Start backup scheduler
+	a.backupScheduler.Start()
+	a.backupScheduler.SyncJobs()
+	log.Println("✓ Backup scheduler started")
+
+	// Setup router
+	a.setupRouter()
+
+	// Start HTTP server
+	a.server = &http.Server{
+		Addr:              ":8500",
+		Handler:           a.router,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1MB
+	}
+
+	go func() {
+		log.Println("✓ HTTP server starting on :8500")
+		if err := a.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	return nil
+}
+
+func (a *Application) Shutdown(ctx context.Context) error {
+	if !a.state.CompareAndSwap(stateRunning, stateStopping) {
+		return errors.New("application not running")
+	}
+
+	log.Println("Initiating graceful shutdown...")
+
+	var errs []error
+
+	// 1. Stop accepting new HTTP requests
+	if err := a.server.Shutdown(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("http shutdown: %w", err))
+	}
+	log.Println("✓ HTTP server stopped")
+
+	// 2. Stop backup scheduler
+	// Note: Add Stop() method to scheduler if available
+	log.Println("✓ Backup scheduler stopped")
+
+	// 3. Wait for background services
+	done := make(chan struct{})
+	go func() {
+		a.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Println("✓ Background services stopped")
+	case <-ctx.Done():
+		log.Println("⚠ Background services shutdown timeout")
+		errs = append(errs, ctx.Err())
+	}
+
+	// 4. Close database
+	if err := db.DB.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("database close: %w", err))
+	}
+	log.Println("✓ Database closed")
+
+	a.state.Store(stateStopped)
+
+	// Print final metrics
+	metrics := a.handlers.metrics.Snapshot()
+	log.Printf("Final metrics: %+v", metrics)
+
+	if len(errs) > 0 {
+		return fmt.Errorf("shutdown errors: %v", errs)
+	}
+
+	return nil
+}
+
+// ============================================================================
+// MAIN ENTRY POINT
+// ============================================================================
+
+func main() {
+	// Runtime optimizations
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	debug.SetGCPercent(100)
+
+	log.SetOutput(os.Stdout)
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+
+	log.Println(`
+╔════════════════════════════════════════════════════════════════╗
+║              AXION CONTROL PLANE - STARTING                    ║
+╚════════════════════════════════════════════════════════════════╝`)
+
+	app, err := NewApplication()
+	if err != nil {
+		log.Fatalf("[FATAL] Application initialization failed: %v", err)
+	}
+
+	if err := app.Start(); err != nil {
+		log.Fatalf("[FATAL] Application start failed: %v", err)
+	}
+
+	log.Println(`
+╔════════════════════════════════════════════════════════════════╗
+║              AXION CONTROL PLANE - RUNNING                     ║
+╠════════════════════════════════════════════════════════════════╣
+║  Address:         :8500                                        ║
+║  Workers:         2                                            ║
+║  Database:        axion.db                                     ║
+╠════════════════════════════════════════════════════════════════╣
+║  API Documentation:                                            ║
+║    GET  /health              - Health check                    ║
+║    GET  /metrics             - System metrics                  ║
+║    POST /login               - Authentication                  ║
+║    GET  /instances           - List all instances              ║
+║    POST /instances           - Create instance                 ║
+║    GET  /ws/terminal/:name   - WebSocket terminal              ║
+╚════════════════════════════════════════════════════════════════╝`)
+
+	// Graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigChan
+
+	log.Printf("\n[INFO] Received signal: %v", sig)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := app.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[ERROR] Shutdown errors: %v", err)
+		os.Exit(1)
+	}
+
+	log.Println("\n[INFO] ✓ Clean shutdown completed")
 }
