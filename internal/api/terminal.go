@@ -579,7 +579,7 @@ func GetTerminalMetrics(c *gin.Context) {
 }
 
 // ============================================================================
-// GRACEFUL SHUTDOWN
+// GRACEFUL SHUTDOWN & SESSION TRACKING
 // ============================================================================
 
 var (
@@ -591,25 +591,53 @@ func RegisterSession(id string, session *TerminalSession) {
 	sessionsMutex.Lock()
 	defer sessionsMutex.Unlock()
 	activeSessions[id] = session
+	log.Printf("[SessionTracker] Registered session: %s (total: %d)", id, len(activeSessions))
 }
 
 func UnregisterSession(id string) {
 	sessionsMutex.Lock()
 	defer sessionsMutex.Unlock()
 	delete(activeSessions, id)
+	log.Printf("[SessionTracker] Unregistered session: %s (remaining: %d)", id, len(activeSessions))
+}
+
+func GetActiveSessionCount() int {
+	sessionsMutex.RLock()
+	defer sessionsMutex.RUnlock()
+	return len(activeSessions)
+}
+
+func GetActiveSessionIDs() []string {
+	sessionsMutex.RLock()
+	defer sessionsMutex.RUnlock()
+	
+	ids := make([]string, 0, len(activeSessions))
+	for id := range activeSessions {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 func ShutdownAllSessions(ctx context.Context) error {
 	sessionsMutex.RLock()
 	sessions := make([]*TerminalSession, 0, len(activeSessions))
-	for _, session := range activeSessions {
+	sessionIDs := make([]string, 0, len(activeSessions))
+	for id, session := range activeSessions {
 		sessions = append(sessions, session)
+		sessionIDs = append(sessionIDs, id)
 	}
 	sessionsMutex.RUnlock()
 
-	log.Printf("[Terminal] Shutting down %d active sessions", len(sessions))
+	if len(sessions) == 0 {
+		log.Println("[Terminal] No active sessions to shutdown")
+		return nil
+	}
 
-	for _, session := range sessions {
+	log.Printf("[Terminal] Initiating shutdown of %d active sessions: %v", len(sessions), sessionIDs)
+
+	// Close all sessions
+	for i, session := range sessions {
+		log.Printf("[Terminal] Closing session %d/%d: %s", i+1, len(sessions), sessionIDs[i])
 		session.Close()
 	}
 
@@ -617,20 +645,184 @@ func ShutdownAllSessions(ctx context.Context) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
+	startTime := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			remaining := globalMetrics.sessionsActive.Load()
 			if remaining > 0 {
-				log.Printf("[Terminal] Shutdown timeout: %d sessions still active", remaining)
+				log.Printf("[Terminal] Shutdown timeout after %v: %d sessions still active", 
+					time.Since(startTime), remaining)
 				return fmt.Errorf("shutdown timeout: %d sessions remaining", remaining)
 			}
 			return nil
+			
 		case <-ticker.C:
-			if globalMetrics.sessionsActive.Load() == 0 {
-				log.Println("[Terminal] All sessions closed successfully")
+			active := globalMetrics.sessionsActive.Load()
+			if active == 0 {
+				log.Printf("[Terminal] All sessions closed successfully in %v", time.Since(startTime))
 				return nil
+			}
+			
+			// Log progress every second
+			if time.Since(startTime).Truncate(time.Second) == time.Since(startTime) {
+				log.Printf("[Terminal] Waiting for %d sessions to close...", active)
 			}
 		}
 	}
 }
+
+// ============================================================================
+// HTTP HANDLER
+// ============================================================================
+
+func TerminalHandler(c *gin.Context, instanceService *lxc.InstanceService) {
+	instanceName := c.Param("name")
+	token := c.Query("token")
+
+	// Validate authentication
+	if token == "" {
+		globalMetrics.authFailures.Add(1)
+		c.JSON(401, gin.H{
+			"error": "authentication required",
+			"code":  ErrCodeTokenMissing,
+		})
+		return
+	}
+
+	if _, err := auth.ValidateToken(token); err != nil {
+		globalMetrics.authFailures.Add(1)
+		log.Printf("[Terminal] Auth failed for instance %s: %v", instanceName, err)
+		c.JSON(401, gin.H{
+			"error": "invalid token",
+			"code":  ErrCodeTokenInvalid,
+		})
+		return
+	}
+
+	// Upgrade to WebSocket
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		globalMetrics.upgradeFailures.Add(1)
+		log.Printf("[Terminal] WebSocket upgrade failed for %s: %v", instanceName, err)
+		return
+	}
+
+	// Generate unique session ID
+	sessionID := fmt.Sprintf("%s-%d", instanceName, time.Now().UnixNano())
+	log.Printf("[Terminal] New session %s for instance: %s", sessionID, instanceName)
+
+	// Create session
+	session := NewTerminalSession(instanceName, conn, instanceService)
+	
+	// CRITICAL: Register session for graceful shutdown tracking
+	RegisterSession(sessionID, session)
+	defer UnregisterSession(sessionID)
+	
+	// Start session
+	if err := session.Start(); err != nil {
+		log.Printf("[Terminal] Session %s start failed: %v", sessionID, err)
+		session.writeErrorMessage(err.Error())
+		session.Close()
+		return
+	}
+
+	// Block until session closes
+	<-session.ctx.Done()
+	log.Printf("[Terminal] Session %s completed for instance: %s", sessionID, instanceName)
+}
+
+// ============================================================================
+// METRICS ENDPOINT
+// ============================================================================
+
+func GetTerminalMetrics(c *gin.Context) {
+	metrics := globalMetrics.Snapshot()
+	metrics["active_session_count"] = GetActiveSessionCount()
+	metrics["active_session_ids"] = GetActiveSessionIDs()
+	
+	c.JSON(200, metrics)
+}
+
+// ============================================================================
+// ROUTER REGISTRATION
+// ============================================================================
+
+// RegisterTerminalRoutes registers all terminal-related routes
+// Call this in your main.go during router setup
+func RegisterTerminalRoutes(r *gin.Engine, instanceService *lxc.InstanceService) {
+	// WebSocket endpoint (no auth middleware - token in query param)
+	r.GET("/ws/terminal/:name", func(c *gin.Context) {
+		TerminalHandler(c, instanceService)
+	})
+	
+	// Metrics endpoint (can be public or protected)
+	r.GET("/terminal/metrics", GetTerminalMetrics)
+	
+	// Admin endpoints (should be protected with auth)
+	admin := r.Group("/terminal/admin")
+	// admin.Use(auth.AdminMiddleware()) // Uncomment if you have admin auth
+	{
+		admin.GET("/sessions", ListActiveSessionsHandler)
+		admin.DELETE("/sessions/:id", CloseSessionHandler)
+		admin.POST("/shutdown", ShutdownAllSessionsHandler)
+	}
+}
+
+// ============================================================================
+// INTEGRATION WITH MAIN APPLICATION
+// ============================================================================
+
+// Example integration in main.go:
+/*
+func main() {
+	// ... initialize app ...
+	
+	lxcClient, err := lxc.NewClient()
+	if err != nil {
+		log.Fatal(err)
+	}
+	
+	r := gin.Default()
+	
+	// Register terminal routes
+	api.RegisterTerminalRoutes(r, lxcClient)
+	
+	// Start server
+	srv := &http.Server{
+		Addr:    ":8500",
+		Handler: r,
+	}
+	
+	go func() {
+		if err := srv.ListenAndServe(); err != nil {
+			log.Fatal(err)
+		}
+	}()
+	
+	// Graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	
+	log.Println("Shutting down server...")
+	
+	// Shutdown HTTP server
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("Server shutdown error: %v", err)
+	}
+	
+	// CRITICAL: Shutdown all terminal sessions
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+	
+	if err := api.ShutdownAllSessions(shutdownCtx); err != nil {
+		log.Printf("Terminal shutdown error: %v", err)
+	}
+	
+	log.Println("Server stopped")
+}
+*/
