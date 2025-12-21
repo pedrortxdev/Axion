@@ -1,10 +1,15 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"aexon/internal/auth"
@@ -14,112 +19,618 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// ============================================================================
+// ERROR TAXONOMY
+// ============================================================================
+
+type ErrorCode int
+
+const (
+	ErrCodeAuthFailed ErrorCode = iota + 4000
+	ErrCodeTokenMissing
+	ErrCodeTokenInvalid
+	ErrCodeWebSocketUpgradeFailed
+	ErrCodeInstanceNotFound
+	ErrCodeExecFailed
+	ErrCodeControlTimeout
+	ErrCodeResizeFailed
+	ErrCodeMessageParseFailed
+	ErrCodeConnectionClosed
+	ErrCodeWriteFailed
+	ErrCodeUnexpectedMessage
+)
+
+type TerminalError struct {
+	Code      ErrorCode
+	Message   string
+	Err       error
+	Timestamp int64
+}
+
+func (e *TerminalError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("[%d] %s: %v", e.Code, e.Message, e.Err)
+	}
+	return fmt.Sprintf("[%d] %s", e.Code, e.Message)
+}
+
+func NewTerminalError(code ErrorCode, msg string, err error) *TerminalError {
+	return &TerminalError{
+		Code:      code,
+		Message:   msg,
+		Err:       err,
+		Timestamp: time.Now().UnixNano(),
+	}
+}
+
+// Error constructors
+func ErrTokenMissing() *TerminalError {
+	return NewTerminalError(ErrCodeTokenMissing, "authentication token missing", nil)
+}
+
+func ErrTokenInvalid(err error) *TerminalError {
+	return NewTerminalError(ErrCodeTokenInvalid, "invalid authentication token", err)
+}
+
+func ErrUpgradeFailed(err error) *TerminalError {
+	return NewTerminalError(ErrCodeWebSocketUpgradeFailed, "websocket upgrade failed", err)
+}
+
+func ErrExecFailed(err error) *TerminalError {
+	return NewTerminalError(ErrCodeExecFailed, "failed to execute command", err)
+}
+
+func ErrControlTimeout() *TerminalError {
+	return NewTerminalError(ErrCodeControlTimeout, "timeout waiting for exec control", nil)
+}
+
+func ErrResizeFailed(err error) *TerminalError {
+	return NewTerminalError(ErrCodeResizeFailed, "terminal resize failed", err)
+}
+
+// ============================================================================
+// WEBSOCKET CONFIGURATION
+// ============================================================================
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  8192,
+	WriteBufferSize: 8192,
+	CheckOrigin: func(r *http.Request) bool {
+		return true // In production, validate origin properly
+	},
+	HandshakeTimeout: 10 * time.Second,
+}
+
+const (
+	// Connection timeouts
+	controlTimeout     = 10 * time.Second
+	writeTimeout       = 10 * time.Second
+	readTimeout        = 60 * time.Second
+	pingInterval       = 30 * time.Second
+	maxMessageSize     = 8192
+	shutdownTimeout    = 5 * time.Second
+	
+	// Message types
+	msgTypeResize = "resize"
+	msgTypeData   = "data"
+	msgTypePing   = "ping"
+	msgTypePong   = "pong"
+)
+
+// ============================================================================
+// METRICS
+// ============================================================================
+
+type TerminalMetrics struct {
+	sessionsTotal     atomic.Uint64
+	sessionsActive    atomic.Int64
+	messagesSent      atomic.Uint64
+	messagesReceived  atomic.Uint64
+	resizeCommands    atomic.Uint64
+	errors            atomic.Uint64
+	authFailures      atomic.Uint64
+	upgradeFailures   atomic.Uint64
+}
+
+var globalMetrics = &TerminalMetrics{}
+
+func (m *TerminalMetrics) Snapshot() map[string]interface{} {
+	return map[string]interface{}{
+		"sessions_total":    m.sessionsTotal.Load(),
+		"sessions_active":   m.sessionsActive.Load(),
+		"messages_sent":     m.messagesSent.Load(),
+		"messages_received": m.messagesReceived.Load(),
+		"resize_commands":   m.resizeCommands.Load(),
+		"errors":            m.errors.Load(),
+		"auth_failures":     m.authFailures.Load(),
+		"upgrade_failures":  m.upgradeFailures.Load(),
+	}
+}
+
+// ============================================================================
+// WEBSOCKET WRITER
+// ============================================================================
+
 type wsWriter struct {
-	conn *websocket.Conn
+	conn   *websocket.Conn
+	mu     sync.Mutex
+	closed atomic.Bool
+}
+
+func newWSWriter(conn *websocket.Conn) *wsWriter {
+	return &wsWriter{conn: conn}
 }
 
 func (w *wsWriter) Write(p []byte) (n int, err error) {
-	err = w.conn.WriteMessage(websocket.BinaryMessage, p)
-	if err != nil {
-		return 0, err
+	if w.closed.Load() {
+		return 0, errors.New("writer closed")
 	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	
+	if err := w.conn.WriteMessage(websocket.BinaryMessage, p); err != nil {
+		globalMetrics.errors.Add(1)
+		return 0, fmt.Errorf("write failed: %w", err)
+	}
+
+	globalMetrics.messagesSent.Add(1)
 	return len(p), nil
 }
 
 func (w *wsWriter) Close() error {
+	w.closed.Store(true)
 	return nil
 }
 
-// TerminalHandler gerencia a sessão de terminal interativo via WebSocket.
-func TerminalHandler(c *gin.Context, instanceService *lxc.InstanceService) {
-	name := c.Param("name")
-	token := c.Query("token")
+// ============================================================================
+// MESSAGE TYPES
+// ============================================================================
 
-	if token == "" {
-		c.AbortWithStatusJSON(401, gin.H{"error": "Token missing"})
-		return
-	}
-	if _, err := auth.ValidateToken(token); err != nil {
-		c.AbortWithStatusJSON(401, gin.H{"error": "Invalid token"})
-		return
-	}
+type ResizeMessage struct {
+	Type string `json:"type"`
+	Cols int    `json:"cols"`
+	Rows int    `json:"rows"`
+}
 
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
-	if err != nil {
-		log.Printf("Terminal Upgrade Failed: %v", err)
-		return
-	}
-	defer conn.Close()
+type LXDResizeCommand struct {
+	Command string `json:"command"`
+	Width   int    `json:"width"`
+	Height  int    `json:"height"`
+}
 
+type ControlMessage struct {
+	Type    string `json:"type"`
+	Payload []byte `json:"payload,omitempty"`
+}
+
+// ============================================================================
+// TERMINAL SESSION
+// ============================================================================
+
+type TerminalSession struct {
+	instanceName    string
+	conn            *websocket.Conn
+	execControl     *websocket.Conn
+	stdinReader     *io.PipeReader
+	stdinWriter     *io.PipeWriter
+	stdoutWriter    *wsWriter
+	instanceService *lxc.InstanceService
+	
+	ctx             context.Context
+	cancel          context.CancelFunc
+	
+	state           atomic.Uint32
+	errCh           chan error
+	controlCh       chan *websocket.Conn
+	
+	wg              sync.WaitGroup
+	closeOnce       sync.Once
+}
+
+const (
+	sessionStateCreated uint32 = 0
+	sessionStateRunning uint32 = 1
+	sessionStateClosing uint32 = 2
+	sessionStateClosed  uint32 = 3
+)
+
+func NewTerminalSession(instanceName string, conn *websocket.Conn, instanceService *lxc.InstanceService) *TerminalSession {
+	ctx, cancel := context.WithCancel(context.Background())
 	stdinReader, stdinWriter := io.Pipe()
-	stdoutWriter := &wsWriter{conn: conn}
-
-	// Controle: agora usando *websocket.Conn
-	controlCh := make(chan *websocket.Conn)
-
-	go func() {
-		controlFunc := func(control *websocket.Conn) {
-			controlCh <- control
-		}
-
-		err := instanceService.ExecInteractive(
-			name,
-			[]string{"/bin/bash"},
-			stdinReader,
-			stdoutWriter,
-			stdoutWriter,
-			controlFunc,
-		)
-
-		if err != nil {
-			log.Printf("Terminal session ended with error: %v", err)
-			conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("\r\nSession ended: %v\r\n", err)))
-		}
-		conn.Close()
-	}()
-
-	var execControl *websocket.Conn
-	select {
-	case execControl = <-controlCh:
-		// OK
-	case <-time.After(10 * time.Second):
-		log.Printf("Timeout waiting for exec control")
-		return
+	
+	session := &TerminalSession{
+		instanceName:    instanceName,
+		conn:            conn,
+		stdinReader:     stdinReader,
+		stdinWriter:     stdinWriter,
+		stdoutWriter:    newWSWriter(conn),
+		instanceService: instanceService,
+		ctx:             ctx,
+		cancel:          cancel,
+		errCh:           make(chan error, 1),
+		controlCh:       make(chan *websocket.Conn, 1),
 	}
-	// O execControl é um WS que pode receber JSON de resize/signal.
-	// Podemos fechar quando terminarmos.
-	defer execControl.Close()
+	
+	session.state.Store(sessionStateCreated)
+	return session
+}
+
+func (s *TerminalSession) Start() error {
+	if !s.state.CompareAndSwap(sessionStateCreated, sessionStateRunning) {
+		return errors.New("session already started")
+	}
+
+	globalMetrics.sessionsTotal.Add(1)
+	globalMetrics.sessionsActive.Add(1)
+
+	// Start exec goroutine
+	s.wg.Add(1)
+	go s.execLoop()
+
+	// Wait for control channel with timeout
+	select {
+	case s.execControl = <-s.controlCh:
+		log.Printf("[Session %s] Control channel established", s.instanceName)
+	case <-time.After(controlTimeout):
+		s.Close()
+		globalMetrics.errors.Add(1)
+		return ErrControlTimeout()
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	}
+
+	// Start message reader
+	s.wg.Add(1)
+	go s.readLoop()
+
+	// Start ping/pong keeper
+	s.wg.Add(1)
+	go s.pingLoop()
+
+	return nil
+}
+
+func (s *TerminalSession) execLoop() {
+	defer s.wg.Done()
+	defer log.Printf("[Session %s] Exec loop terminated", s.instanceName)
+
+	controlFunc := func(control *websocket.Conn) {
+		select {
+		case s.controlCh <- control:
+		case <-s.ctx.Done():
+		}
+	}
+
+	err := s.instanceService.ExecInteractive(
+		s.instanceName,
+		[]string{"/bin/bash"},
+		s.stdinReader,
+		s.stdoutWriter,
+		s.stdoutWriter,
+		controlFunc,
+	)
+
+	if err != nil {
+		log.Printf("[Session %s] Exec ended with error: %v", s.instanceName, err)
+		globalMetrics.errors.Add(1)
+		
+		// Notify client
+		s.writeErrorMessage(fmt.Sprintf("Session ended: %v", err))
+	} else {
+		log.Printf("[Session %s] Exec ended normally", s.instanceName)
+	}
+
+	s.Close()
+}
+
+func (s *TerminalSession) readLoop() {
+	defer s.wg.Done()
+	defer log.Printf("[Session %s] Read loop terminated", s.instanceName)
+	defer s.Close()
+
+	s.conn.SetReadLimit(maxMessageSize)
+	s.conn.SetReadDeadline(time.Now().Add(readTimeout))
+	s.conn.SetPongHandler(func(string) error {
+		s.conn.SetReadDeadline(time.Now().Add(readTimeout))
+		return nil
+	})
 
 	for {
-		mt, message, err := conn.ReadMessage()
-		if err != nil {
-			break
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
 		}
 
-		if mt == websocket.TextMessage {
-			var msg struct {
-				Type string `json:"type"`
-				Cols int    `json:"cols"`
-				Rows int    `json:"rows"`
+		mt, message, err := s.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.Printf("[Session %s] Client closed connection", s.instanceName)
+			} else {
+				log.Printf("[Session %s] Read error: %v", s.instanceName, err)
+				globalMetrics.errors.Add(1)
 			}
+			return
+		}
 
-			// Se for resize, enviamos para o canal de controle do LXD
-			// O protocolo LXD espera JSON: { "command": "window-resize", "width": ..., "height": ... }
-			if err := json.Unmarshal(message, &msg); err == nil && msg.Type == "resize" {
-				if execControl != nil {
-					lxdMsg := map[string]interface{}{
-						"command": "window-resize",
-						"width":   msg.Cols, // Cols = Width
-						"height":  msg.Rows, // Rows = Height
-					}
-					execControl.WriteJSON(lxdMsg)
-				}
-				continue
+		globalMetrics.messagesReceived.Add(1)
+		s.conn.SetReadDeadline(time.Now().Add(readTimeout))
+
+		if err := s.handleMessage(mt, message); err != nil {
+			log.Printf("[Session %s] Message handling error: %v", s.instanceName, err)
+			globalMetrics.errors.Add(1)
+		}
+	}
+}
+
+func (s *TerminalSession) handleMessage(messageType int, message []byte) error {
+	switch messageType {
+	case websocket.TextMessage:
+		return s.handleTextMessage(message)
+	case websocket.BinaryMessage:
+		return s.handleBinaryMessage(message)
+	case websocket.PingMessage:
+		return s.conn.WriteControl(websocket.PongMessage, nil, time.Now().Add(writeTimeout))
+	default:
+		return fmt.Errorf("unexpected message type: %d", messageType)
+	}
+}
+
+func (s *TerminalSession) handleTextMessage(message []byte) error {
+	var msg ResizeMessage
+	
+	if err := json.Unmarshal(message, &msg); err == nil && msg.Type == msgTypeResize {
+		return s.handleResize(msg.Cols, msg.Rows)
+	}
+
+	// Not a resize command, treat as stdin data
+	return s.writeToStdin(message)
+}
+
+func (s *TerminalSession) handleBinaryMessage(message []byte) error {
+	return s.writeToStdin(message)
+}
+
+func (s *TerminalSession) handleResize(cols, rows int) error {
+	if s.execControl == nil {
+		return errors.New("control channel not available")
+	}
+
+	if cols <= 0 || rows <= 0 {
+		return fmt.Errorf("invalid dimensions: cols=%d rows=%d", cols, rows)
+	}
+
+	lxdMsg := LXDResizeCommand{
+		Command: "window-resize",
+		Width:   cols,
+		Height:  rows,
+	}
+
+	s.execControl.SetWriteDeadline(time.Now().Add(writeTimeout))
+	if err := s.execControl.WriteJSON(lxdMsg); err != nil {
+		globalMetrics.errors.Add(1)
+		return ErrResizeFailed(err)
+	}
+
+	globalMetrics.resizeCommands.Add(1)
+	log.Printf("[Session %s] Terminal resized to %dx%d", s.instanceName, cols, rows)
+	return nil
+}
+
+func (s *TerminalSession) writeToStdin(data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+
+	select {
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	default:
+	}
+
+	_, err := s.stdinWriter.Write(data)
+	if err != nil {
+		globalMetrics.errors.Add(1)
+		return fmt.Errorf("stdin write failed: %w", err)
+	}
+
+	return nil
+}
+
+func (s *TerminalSession) writeErrorMessage(msg string) {
+	errorMsg := fmt.Sprintf("\r\n[ERROR] %s\r\n", msg)
+	s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	s.conn.WriteMessage(websocket.TextMessage, []byte(errorMsg))
+}
+
+func (s *TerminalSession) pingLoop() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			if err := s.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				log.Printf("[Session %s] Ping failed: %v", s.instanceName, err)
+				s.Close()
+				return
 			}
+		case <-s.ctx.Done():
+			return
+		}
+	}
+}
 
-			stdinWriter.Write(message)
-		} else {
-			stdinWriter.Write(message)
+func (s *TerminalSession) Close() {
+	s.closeOnce.Do(func() {
+		if !s.state.CompareAndSwap(sessionStateRunning, sessionStateClosing) {
+			return
+		}
+
+		log.Printf("[Session %s] Initiating shutdown", s.instanceName)
+
+		// Cancel context to signal all goroutines
+		s.cancel()
+
+		// Close pipes
+		s.stdinWriter.Close()
+		s.stdinReader.Close()
+		s.stdoutWriter.Close()
+
+		// Close exec control
+		if s.execControl != nil {
+			s.execControl.WriteMessage(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+			)
+			s.execControl.Close()
+		}
+
+		// Close main connection
+		s.conn.WriteMessage(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		)
+		s.conn.Close()
+
+		// Wait for all goroutines with timeout
+		done := make(chan struct{})
+		go func() {
+			s.wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			log.Printf("[Session %s] Clean shutdown", s.instanceName)
+		case <-time.After(shutdownTimeout):
+			log.Printf("[Session %s] Shutdown timeout", s.instanceName)
+		}
+
+		s.state.Store(sessionStateClosed)
+		globalMetrics.sessionsActive.Add(-1)
+	})
+}
+
+// ============================================================================
+// HTTP HANDLER
+// ============================================================================
+
+func TerminalHandler(c *gin.Context, instanceService *lxc.InstanceService) {
+	instanceName := c.Param("name")
+	token := c.Query("token")
+
+	// Validate authentication
+	if token == "" {
+		globalMetrics.authFailures.Add(1)
+		c.JSON(401, gin.H{
+			"error": "authentication required",
+			"code":  ErrCodeTokenMissing,
+		})
+		return
+	}
+
+	if _, err := auth.ValidateToken(token); err != nil {
+		globalMetrics.authFailures.Add(1)
+		log.Printf("[Terminal] Auth failed for instance %s: %v", instanceName, err)
+		c.JSON(401, gin.H{
+			"error": "invalid token",
+			"code":  ErrCodeTokenInvalid,
+		})
+		return
+	}
+
+	// Upgrade to WebSocket
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		globalMetrics.upgradeFailures.Add(1)
+		log.Printf("[Terminal] WebSocket upgrade failed for %s: %v", instanceName, err)
+		return
+	}
+
+	log.Printf("[Terminal] New session for instance: %s", instanceName)
+
+	// Create and start session
+	session := NewTerminalSession(instanceName, conn, instanceService)
+	
+	if err := session.Start(); err != nil {
+		log.Printf("[Terminal] Session start failed for %s: %v", instanceName, err)
+		session.writeErrorMessage(err.Error())
+		session.Close()
+		return
+	}
+
+	// Block until session closes
+	<-session.ctx.Done()
+	log.Printf("[Terminal] Session completed for instance: %s", instanceName)
+}
+
+// ============================================================================
+// METRICS ENDPOINT
+// ============================================================================
+
+func GetTerminalMetrics(c *gin.Context) {
+	c.JSON(200, globalMetrics.Snapshot())
+}
+
+// ============================================================================
+// GRACEFUL SHUTDOWN
+// ============================================================================
+
+var (
+	activeSessions   = make(map[string]*TerminalSession)
+	sessionsMutex    sync.RWMutex
+)
+
+func RegisterSession(id string, session *TerminalSession) {
+	sessionsMutex.Lock()
+	defer sessionsMutex.Unlock()
+	activeSessions[id] = session
+}
+
+func UnregisterSession(id string) {
+	sessionsMutex.Lock()
+	defer sessionsMutex.Unlock()
+	delete(activeSessions, id)
+}
+
+func ShutdownAllSessions(ctx context.Context) error {
+	sessionsMutex.RLock()
+	sessions := make([]*TerminalSession, 0, len(activeSessions))
+	for _, session := range activeSessions {
+		sessions = append(sessions, session)
+	}
+	sessionsMutex.RUnlock()
+
+	log.Printf("[Terminal] Shutting down %d active sessions", len(sessions))
+
+	for _, session := range sessions {
+		session.Close()
+	}
+
+	// Wait for all sessions to close with timeout
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			remaining := globalMetrics.sessionsActive.Load()
+			if remaining > 0 {
+				log.Printf("[Terminal] Shutdown timeout: %d sessions still active", remaining)
+				return fmt.Errorf("shutdown timeout: %d sessions remaining", remaining)
+			}
+			return nil
+		case <-ticker.C:
+			if globalMetrics.sessionsActive.Load() == 0 {
+				log.Println("[Terminal] All sessions closed successfully")
+				return nil
+			}
 		}
 	}
 }
