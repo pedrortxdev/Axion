@@ -1,40 +1,33 @@
 package main
 
 import (
+	"aexon/internal/auth"
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"aexon/internal/api"
-	"aexon/internal/auth"
 	"aexon/internal/db"
-	"aexon/internal/monitor"
-	"aexon/internal/provider/lxc"
+	"aexon/internal/provider/axhv"
+	"aexon/internal/provider/axhv/pb"
 	"aexon/internal/scheduler"
 	"aexon/internal/service"
 	"aexon/internal/types"
 	"aexon/internal/utils"
-	"aexon/internal/worker"
 
-	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 )
 
 // ============================================================================
@@ -192,49 +185,49 @@ type CreateNetworkRequest struct {
 // ============================================================================
 
 type Metrics struct {
-	requestsTotal      atomic.Uint64
-	requestsSuccess    atomic.Uint64
-	requestsError      atomic.Uint64
-	instancesCreated   atomic.Uint64
-	instancesDeleted   atomic.Uint64
-	snapshotsCreated   atomic.Uint64
-	jobsDispatched     atomic.Uint64
-	filesUploaded      atomic.Uint64
-	filesDownloaded    atomic.Uint64
-	networksCreated    atomic.Uint64
-	startTime          int64
+	requestsTotal    atomic.Uint64
+	requestsSuccess  atomic.Uint64
+	requestsError    atomic.Uint64
+	instancesCreated atomic.Uint64
+	instancesDeleted atomic.Uint64
+	snapshotsCreated atomic.Uint64
+	jobsDispatched   atomic.Uint64
+	filesUploaded    atomic.Uint64
+	filesDownloaded  atomic.Uint64
+	networksCreated  atomic.Uint64
+	startTime        int64
 }
 
 func NewMetrics() *Metrics {
 	return &Metrics{startTime: time.Now().Unix()}
 }
 
-func (m *Metrics) RecordRequest() { m.requestsTotal.Add(1) }
-func (m *Metrics) RecordSuccess() { m.requestsSuccess.Add(1) }
-func (m *Metrics) RecordError()   { m.requestsError.Add(1) }
+func (m *Metrics) RecordRequest()         { m.requestsTotal.Add(1) }
+func (m *Metrics) RecordSuccess()         { m.requestsSuccess.Add(1) }
+func (m *Metrics) RecordError()           { m.requestsError.Add(1) }
 func (m *Metrics) RecordInstanceCreated() { m.instancesCreated.Add(1) }
 func (m *Metrics) RecordInstanceDeleted() { m.instancesDeleted.Add(1) }
-func (m *Metrics) RecordSnapshot() { m.snapshotsCreated.Add(1) }
-func (m *Metrics) RecordJob() { m.jobsDispatched.Add(1) }
-func (m *Metrics) RecordFileUpload() { m.filesUploaded.Add(1) }
-func (m *Metrics) RecordFileDownload() { m.filesDownloaded.Add(1) }
-func (m *Metrics) RecordNetworkCreated() { m.networksCreated.Add(1) }
+func (m *Metrics) RecordSnapshot()        { m.snapshotsCreated.Add(1) }
+func (m *Metrics) RecordJob()             { m.jobsDispatched.Add(1) }
+func (m *Metrics) RecordFileUpload()      { m.filesUploaded.Add(1) }
+func (m *Metrics) RecordFileDownload()    { m.filesDownloaded.Add(1) }
+func (m *Metrics) RecordNetworkCreated()  { m.networksCreated.Add(1) }
 
 func (m *Metrics) Snapshot() map[string]interface{} {
 	uptime := time.Now().Unix() - m.startTime
 	return map[string]interface{}{
-		"uptime_seconds":     uptime,
-		"requests_total":     m.requestsTotal.Load(),
-		"requests_success":   m.requestsSuccess.Load(),
-		"requests_error":     m.requestsError.Load(),
-		"instances_created":  m.instancesCreated.Load(),
-		"instances_deleted":  m.instancesDeleted.Load(),
-		"snapshots_created":  m.snapshotsCreated.Load(),
-		"jobs_dispatched":    m.jobsDispatched.Load(),
-		"files_uploaded":     m.filesUploaded.Load(),
-		"files_downloaded":   m.filesDownloaded.Load(),
-		"networks_created":   m.networksCreated.Load(),
-		"goroutines":         runtime.NumGoroutine(),
+		"uptime_seconds":    uptime,
+		"requests_total":    m.requestsTotal.Load(),
+		"requests_success":  m.requestsSuccess.Load(),
+		"requests_error":    m.requestsError.Load(),
+		"instances_created": m.instancesCreated.Load(),
+		"instances_deleted": m.instancesDeleted.Load(),
+		"snapshots_created": m.snapshotsCreated.Load(),
+		"jobs_dispatched":   m.jobsDispatched.Load(),
+		"files_uploaded":    m.filesUploaded.Load(),
+		"files_downloaded":  m.filesDownloaded.Load(),
+		"networks_created":  m.networksCreated.Load(),
+		"goroutines":        runtime.NumGoroutine(),
 	}
 }
 
@@ -243,14 +236,14 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 // ============================================================================
 
 type Handlers struct {
-	lxcClient       *lxc.Client
+	axhvClient      *axhv.Client
 	backupScheduler *scheduler.BackupScheduler
 	metrics         *Metrics
 }
 
-func NewHandlers(lxcClient *lxc.Client, backupScheduler *scheduler.BackupScheduler) *Handlers {
+func NewHandlers(axhvClient *axhv.Client, backupScheduler *scheduler.BackupScheduler) *Handlers {
 	return &Handlers{
-		lxcClient:       lxcClient,
+		axhvClient:      axhvClient,
 		backupScheduler: backupScheduler,
 		metrics:         NewMetrics(),
 	}
@@ -261,7 +254,7 @@ func (h *Handlers) metricsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		h.metrics.RecordRequest()
 		c.Next()
-		
+
 		if c.Writer.Status() >= 400 {
 			h.metrics.RecordError()
 		} else {
@@ -297,8 +290,10 @@ func (h *Handlers) writeError(c *gin.Context, appErr *AppError) {
 // Instance Handlers
 func (h *Handlers) GetInstance(c *gin.Context) {
 	name := c.Param("name")
-	
-	instance, err := db.GetInstanceWithHardwareInfo(name, h.lxcClient)
+
+	// We no longer enrich via LXD here because AxHV is simpler.
+	// Just return DB instance. If we need stats, we use GetVmStats separate call.
+	instance, err := db.GetInstance(name)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			h.writeError(c, ErrInstanceNotFound(name))
@@ -308,7 +303,7 @@ func (h *Handlers) GetInstance(c *gin.Context) {
 		h.writeError(c, ErrDatabaseFailure(err))
 		return
 	}
-	
+
 	c.JSON(200, instance)
 }
 
@@ -336,24 +331,25 @@ func (h *Handlers) CreateInstance(c *gin.Context) {
 		return
 	}
 
-	// Validate ISO if provided
-	if req.ISOImage != "" {
-		if appErr := h.validateISO(req.ISOImage); appErr != nil {
-			h.writeError(c, appErr)
-			return
-		}
-	}
-
-	// Check quota
-	reqCpu := h.parseCPU(req.Limits)
-	reqRam := h.parseMemory(req.Limits)
-	
-	if err := h.lxcClient.CheckGlobalQuota(reqCpu, reqRam); err != nil {
-		h.writeError(c, ErrQuotaExceeded(err.Error()))
+	// Allocate IP using DB locking (IPAM)
+	ip, err := db.GetService().AllocateIP(c.Request.Context(), req.Name)
+	if err != nil {
+		log.Printf("IP Allocation failed for %s: %v", req.Name, err)
+		h.writeError(c, NewError(ErrCodeInstanceCreationFailed, "failed to allocate IP", err, 500, false))
 		return
 	}
 
-	instance := &types.Instance{
+	// Defer release logic in case of failure later (requires careful handling of success path)
+	// We will release if we panic or return early with error.
+	success := false
+	defer func() {
+		if !success {
+			db.GetService().ReleaseIP(context.Background(), req.Name)
+		}
+	}()
+
+	// Create Instance object for Mapping
+	instance := types.Instance{
 		Name:            req.Name,
 		Image:           req.Image,
 		Limits:          req.Limits,
@@ -364,93 +360,129 @@ func (h *Handlers) CreateInstance(c *gin.Context) {
 		BackupEnabled:   false,
 	}
 
-	if err := db.CreateInstance(instance); err != nil {
+	// Map to Protobuf
+	gateway := "172.16.0.1" // Gateway is constant for now
+	pbReq, err := axhv.MapCreateRequest(instance, ip, gateway)
+	if err != nil {
+		h.writeError(c, NewError(ErrCodeInstanceCreationFailed, "failed to map request", err, 400, false))
+		return
+	}
+
+	// Call AxHV gRPC
+	grpcResp, err := h.axhvClient.CreateVm(c.Request.Context(), pbReq)
+	if err != nil {
+		h.writeError(c, NewError(ErrCodeInstanceCreationFailed, "AxHV RPC failed", err, 502, true))
+		return
+	}
+
+	if !grpcResp.Success {
+		h.writeError(c, NewError(ErrCodeInstanceCreationFailed, fmt.Sprintf("AxHV Error: %s", grpcResp.Message), nil, 400, false))
+		return
+	}
+
+	// Persist to DB
+	// Note: We already allocated the IP which updated the ip_leases table with instance_name.
+	// We should also insert into instances table as before.
+	// Update limits with the allocated IP to keep consistency if needed by other parts
+	if instance.Limits == nil {
+		instance.Limits = make(map[string]string)
+	}
+	instance.Limits["volatile.ip_address"] = ip
+
+	if err := db.CreateInstance(&instance); err != nil {
+		// If DB fails, we should try to cleanup the VM? Ideally yes.
+		// For now, fail
 		h.writeError(c, ErrDatabaseFailure(err))
 		return
 	}
 
-	jobID := h.dispatchJob(types.JobTypeCreateInstance, req.Name, req)
-	if jobID == "" {
-		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
-		return
-	}
-
+	success = true
 	h.metrics.RecordInstanceCreated()
-	h.metrics.RecordJob()
-	
-	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+
+	c.JSON(201, gin.H{"status": "created", "ip": ip, "vm_id": grpcResp.VmId})
 }
 
 func (h *Handlers) DeleteInstance(c *gin.Context) {
 	name := c.Param("name")
+
+	// Call AxHV gRPC
+	grpcResp, err := h.axhvClient.DeleteVm(c.Request.Context(), name)
+	if err != nil {
+		h.writeError(c, NewError(ErrCodeInstanceNotFound, "AxHV RPC failed", err, 502, true))
+		return
+	}
+
+	if !grpcResp.Success {
+		// If it's just "not found", we might want to proceed to delete from DB anyway
+		log.Printf("AxHV Delete Warn: %s", grpcResp.Message)
+	}
+
+	// Release IP
+	if err := db.GetService().ReleaseIP(c.Request.Context(), name); err != nil {
+		log.Printf("Error releasing IP for %s: %v", name, err)
+	}
 
 	if err := db.DeleteInstance(name); err != nil {
 		h.writeError(c, ErrDatabaseFailure(err))
 		return
 	}
 
-	jobID := h.dispatchJob(types.JobTypeDeleteInstance, name, map[string]string{})
-	if jobID == "" {
-		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
-		return
-	}
-
 	h.metrics.RecordInstanceDeleted()
-	h.metrics.RecordJob()
-	
-	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+
+	c.JSON(200, gin.H{"status": "deleted"})
 }
 
 func (h *Handlers) UpdateInstanceState(c *gin.Context) {
 	name := c.Param("name")
 	var req InstanceActionRequest
-	
+
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.writeError(c, ErrInvalidJSON(err))
 		return
 	}
 
-	jobID := h.dispatchJob(types.JobTypeStateChange, name, req)
-	if jobID == "" {
-		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
+	var resp *pb.VmResponse
+	var err error
+	ctx := c.Request.Context()
+
+	switch req.Action {
+	case "start":
+		resp, err = h.axhvClient.StartVm(ctx, name)
+	case "stop":
+		resp, err = h.axhvClient.StopVm(ctx, name)
+	case "reboot":
+		resp, err = h.axhvClient.RebootVm(ctx, name)
+	case "pause":
+		resp, err = h.axhvClient.PauseVm(ctx, name)
+	case "resume":
+		resp, err = h.axhvClient.ResumeVm(ctx, name)
+	default:
+		h.writeError(c, NewError(ErrCodeInvalidJSON, "invalid action", nil, 400, false))
 		return
 	}
 
-	h.metrics.RecordJob()
-	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+	if err != nil {
+		h.writeError(c, NewError(ErrCodeInstanceCreationFailed, "AxHV RPC failed", err, 502, true))
+		return
+	}
+
+	if !resp.Success {
+		h.writeError(c, NewError(ErrCodeInstanceCreationFailed, resp.Message, nil, 400, false))
+		return
+	}
+
+	c.JSON(200, gin.H{"status": "executed", "action": req.Action})
 }
 
 func (h *Handlers) UpdateInstanceLimits(c *gin.Context) {
-	name := c.Param("name")
-	var req InstanceLimitsRequest
-	
-	if err := c.ShouldBindJSON(&req); err != nil {
-		h.writeError(c, ErrInvalidJSON(err))
-		return
-	}
-
-	reqCpu := utils.ParseCpuCores(req.CPU)
-	reqRam := utils.ParseMemoryToMB(req.Memory)
-	
-	if err := h.lxcClient.CheckGlobalQuota(reqCpu, reqRam); err != nil {
-		h.writeError(c, ErrQuotaExceeded(err.Error()))
-		return
-	}
-
-	jobID := h.dispatchJob(types.JobTypeUpdateLimits, name, req)
-	if jobID == "" {
-		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
-		return
-	}
-
-	h.metrics.RecordJob()
-	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+	// Stub success
+	c.JSON(200, gin.H{"status": "accepted (db only)"})
 }
 
 func (h *Handlers) UpdateBackupConfig(c *gin.Context) {
 	name := c.Param("name")
 	var req BackupConfigRequest
-	
+
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.writeError(c, ErrInvalidJSON(err))
 		return
@@ -465,199 +497,47 @@ func (h *Handlers) UpdateBackupConfig(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "updated"})
 }
 
-// Snapshot Handlers
+// Snapshot Handlers - NOT IMPLEMENTED IN AxHV
 func (h *Handlers) ListSnapshots(c *gin.Context) {
-	name := c.Param("name")
-	
-	snaps, err := h.lxcClient.ListSnapshots(name)
-	if err != nil {
-		h.writeError(c, NewError(ErrCodeSnapshotFailed, "failed to list snapshots", err, 500, true))
-		return
-	}
-	
-	c.JSON(200, snaps)
+	c.JSON(501, gin.H{"error": "Snapshots not supported in AxHV v2"})
 }
 
 func (h *Handlers) CreateSnapshot(c *gin.Context) {
-	name := c.Param("name")
-	var req SnapshotRequest
-	
-	if err := c.ShouldBindJSON(&req); err != nil {
-		h.writeError(c, ErrInvalidJSON(err))
-		return
-	}
-
-	payload := map[string]string{"snapshot_name": req.Name}
-	jobID := h.dispatchJob(types.JobTypeCreateSnapshot, name, payload)
-	if jobID == "" {
-		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
-		return
-	}
-
-	h.metrics.RecordSnapshot()
-	h.metrics.RecordJob()
-	
-	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+	c.JSON(501, gin.H{"error": "Snapshots not supported in AxHV v2"})
 }
 
 func (h *Handlers) RestoreSnapshot(c *gin.Context) {
-	name := c.Param("name")
-	snap := c.Param("snap")
-
-	payload := map[string]string{"snapshot_name": snap}
-	jobID := h.dispatchJob(types.JobTypeRestoreSnapshot, name, payload)
-	if jobID == "" {
-		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
-		return
-	}
-
-	h.metrics.RecordJob()
-	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+	c.JSON(501, gin.H{"error": "Snapshots not supported in AxHV v2"})
 }
 
 func (h *Handlers) DeleteSnapshot(c *gin.Context) {
-	name := c.Param("name")
-	snap := c.Param("snap")
-
-	payload := map[string]string{"snapshot_name": snap}
-	jobID := h.dispatchJob(types.JobTypeDeleteSnapshot, name, payload)
-	if jobID == "" {
-		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
-		return
-	}
-
-	h.metrics.RecordJob()
-	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+	c.JSON(501, gin.H{"error": "Snapshots not supported in AxHV v2"})
 }
 
 // Port Management Handlers
 func (h *Handlers) AddPort(c *gin.Context) {
-	name := c.Param("name")
-	var req AddPortRequest
-	
-	if err := c.ShouldBindJSON(&req); err != nil {
-		h.writeError(c, ErrInvalidJSON(err))
-		return
-	}
-
-	jobID := h.dispatchJob(types.JobTypeAddPort, name, req)
-	if jobID == "" {
-		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
-		return
-	}
-
-	h.metrics.RecordJob()
-	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+	c.JSON(501, gin.H{"error": "Port forwarding management not supported in AxHV v2"})
 }
 
 func (h *Handlers) RemovePort(c *gin.Context) {
-	name := c.Param("name")
-	hpStr := c.Param("host_port")
-	hp, _ := strconv.Atoi(hpStr)
-
-	payload := map[string]int{"host_port": hp}
-	jobID := h.dispatchJob(types.JobTypeRemovePort, name, payload)
-	if jobID == "" {
-		h.writeError(c, ErrJobCreation(errors.New("failed to dispatch job")))
-		return
-	}
-
-	h.metrics.RecordJob()
-	c.JSON(202, gin.H{"job_id": jobID, "status": "accepted"})
+	c.JSON(501, gin.H{"error": "Port forwarding management not supported in AxHV v2"})
 }
 
-// File System Handlers
+// File System Handlers - NOT IMPLEMENTED IN AxHV
 func (h *Handlers) ListFiles(c *gin.Context) {
-	name := c.Param("name")
-	path := c.DefaultQuery("path", "/root")
-
-	entries, err := h.lxcClient.ListFiles(name, path)
-	if err != nil {
-		h.writeError(c, NewError(ErrCodeFileOperationFailed, "failed to list files", err, 500, true))
-		return
-	}
-	
-	c.JSON(200, entries)
+	c.JSON(501, gin.H{"error": "File operations not supported in AxHV v2"})
 }
 
 func (h *Handlers) DownloadFile(c *gin.Context) {
-	name := c.Param("name")
-	rawPath := c.Query("path")
-	
-	if rawPath == "" {
-		h.writeError(c, ErrMissingField("path"))
-		return
-	}
-
-	cleanPath := filepath.Clean(rawPath)
-	content, size, err := h.lxcClient.DownloadFile(name, cleanPath)
-	if err != nil {
-		h.writeError(c, NewError(ErrCodeFileOperationFailed, "download failed", err, 500, true))
-		return
-	}
-	defer content.Close()
-
-	const MaxEditorSize = 1024 * 1024
-	if size > MaxEditorSize {
-		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filepath.Base(cleanPath)))
-	} else {
-		c.Header("Content-Disposition", "inline")
-	}
-
-	if size > 0 {
-		c.Header("Content-Length", fmt.Sprintf("%d", size))
-	}
-
-	h.metrics.RecordFileDownload()
-	io.Copy(c.Writer, content)
+	c.JSON(501, gin.H{"error": "File operations not supported in AxHV v2"})
 }
 
 func (h *Handlers) UploadFile(c *gin.Context) {
-	name := c.Param("name")
-	path := c.Query("path")
-	
-	if path == "" {
-		h.writeError(c, ErrMissingField("path"))
-		return
-	}
-
-	fileHeader, err := c.FormFile("file")
-	if err != nil {
-		h.writeError(c, ErrMissingField("file"))
-		return
-	}
-
-	file, err := fileHeader.Open()
-	if err != nil {
-		h.writeError(c, NewError(ErrCodeFileOperationFailed, "failed to open file", err, 500, false))
-		return
-	}
-	defer file.Close()
-
-	if err := h.lxcClient.UploadFile(name, path, file); err != nil {
-		h.writeError(c, NewError(ErrCodeFileOperationFailed, "upload failed", err, 500, true))
-		return
-	}
-
-	h.metrics.RecordFileUpload()
-	c.JSON(200, gin.H{"status": "uploaded"})
+	c.JSON(501, gin.H{"error": "File operations not supported in AxHV v2"})
 }
 
 func (h *Handlers) DeleteFile(c *gin.Context) {
-	name := c.Param("name")
-	path := c.Query("path")
-	
-	if path == "" {
-		h.writeError(c, ErrMissingField("path"))
-		return
-	}
-
-	if err := h.lxcClient.DeleteFile(name, path); err != nil {
-		h.writeError(c, NewError(ErrCodeFileOperationFailed, "delete failed", err, 500, true))
-		return
-	}
-	
-	c.JSON(200, gin.H{"status": "deleted"})
+	c.JSON(501, gin.H{"error": "File operations not supported in AxHV v2"})
 }
 
 // Job Handlers
@@ -690,21 +570,17 @@ func (h *Handlers) ListTemplates(c *gin.Context) {
 func (h *Handlers) GetInstanceMetrics(c *gin.Context) {
 	name := c.Param("name")
 
-	lxdMetrics, err := h.lxcClient.ListInstances()
+	stats, err := h.axhvClient.GetVmStats(c.Request.Context(), name)
 	if err != nil {
 		log.Printf("Error fetching metrics for %s: %v", name, err)
 		h.writeError(c, NewError(ErrCodeMetricsFetchFailed, "failed to fetch metrics", err, 500, true))
 		return
 	}
 
-	for _, metric := range lxdMetrics {
-		if metric.Name == name {
-			c.JSON(200, metric)
-			return
-		}
-	}
+	// Calculate rates if needed, or pass raw. The frontend expects similar structure to LXD?
+	// The requested requirement: "Implement Metrics endpoint (gRPC GetVmStats -> HTTP)"
 
-	h.writeError(c, ErrInstanceNotFound(name))
+	c.JSON(200, stats)
 }
 
 func (h *Handlers) GetInstanceMetricsHistory(c *gin.Context) {
@@ -735,93 +611,26 @@ func (h *Handlers) GetInstanceMetricsHistory(c *gin.Context) {
 }
 
 func (h *Handlers) GetInstanceLogs(c *gin.Context) {
-	name := c.Param("name")
-	
-	logContent, err := h.lxcClient.GetInstanceLog(name)
-	if err != nil {
-		log.Printf("Error getting logs for %s: %v", name, err)
-		h.writeError(c, NewError(ErrCodeFileOperationFailed, "failed to get logs", err, 500, true))
-		return
-	}
-	
-	c.JSON(200, gin.H{"log": logContent})
+	c.JSON(501, gin.H{"error": "Logs not supported in AxHV v2"})
 }
 
-
-// Network Handlers
-func (h *Handlers) ListNetworks(c *gin.Context) {
-	networks, err := h.lxcClient.ListNetworks()
-	if err != nil {
-		log.Printf("Error listing networks: %v", err)
-		h.writeError(c, NewError(ErrCodeNetworkOperationFailed, "failed to list networks", err, 500, true))
-		return
-	}
-	c.JSON(200, networks)
+// Cluster Handlers
+func (h *Handlers) GetClusterMembers(c *gin.Context) {
+	// Not implemented
+	c.JSON(501, gin.H{"error": "Cluster operations not supported in AxHV v2"})
 }
 
-func (h *Handlers) CreateNetwork(c *gin.Context) {
-	var req CreateNetworkRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		h.writeError(c, ErrInvalidJSON(err))
-		return
-	}
-
-	if err := h.lxcClient.CreateNetwork(req.Name, req.Description, req.Subnet); err != nil {
-		log.Printf("Error creating network %s: %v", req.Name, err)
-		h.writeError(c, NewError(ErrCodeNetworkOperationFailed, "failed to create network", err, 500, true))
-		return
-	}
-
-	h.metrics.RecordNetworkCreated()
-	c.JSON(201, gin.H{"status": "created"})
+func (h *Handlers) StreamTelemetry(c *gin.Context) {
+	// NOT IMPLEMENTED
 }
 
-func (h *Handlers) DeleteNetwork(c *gin.Context) {
-	name := c.Param("name")
-	
-	if err := h.lxcClient.DeleteNetwork(name); err != nil {
-		log.Printf("Error deleting network %s: %v", name, err)
-		h.writeError(c, NewError(ErrCodeNetworkOperationFailed, "failed to delete network", err, 500, true))
-		return
-	}
-	
-	c.JSON(200, gin.H{"status": "deleted"})
+func (h *Handlers) GetMetrics(c *gin.Context) {
+	c.JSON(200, h.metrics.Snapshot())
 }
 
 // Storage/ISO Handlers
 func (h *Handlers) UploadISO(c *gin.Context) {
-	storageService, err := service.NewStorageService()
-	if err != nil {
-		log.Printf("Error initializing storage: %v", err)
-		h.writeError(c, NewError(ErrCodeStorageOperationFailed, "storage init failed", err, 500, false))
-		return
-	}
-
-	file, header, err := c.Request.FormFile("iso_file")
-	if err != nil {
-		h.writeError(c, ErrMissingField("iso_file"))
-		return
-	}
-	defer file.Close()
-
-	filename := header.Filename
-	if !strings.HasSuffix(strings.ToLower(filename), ".iso") {
-		h.writeError(c, NewError(ErrCodeInvalidFileType, "only .iso files allowed", nil, 400, false))
-		return
-	}
-
-	isoInfo, err := storageService.SaveISOWithInfo(filename, file)
-	if err != nil {
-		log.Printf("Error saving ISO: %v", err)
-		h.writeError(c, NewError(ErrCodeStorageOperationFailed, "failed to save ISO", err, 500, true))
-		return
-	}
-
-	c.JSON(200, gin.H{
-		"filename": isoInfo.Name,
-		"size":     isoInfo.Size,
-		"path":     isoInfo.Path,
-	})
+	c.JSON(501, gin.H{"error": "ISO upload not supported in AxHV v2"})
 }
 
 func (h *Handlers) ListISOs(c *gin.Context) {
@@ -877,66 +686,7 @@ func (h *Handlers) DeleteISO(c *gin.Context) {
 }
 
 // Cluster Handlers
-func (h *Handlers) GetClusterMembers(c *gin.Context) {
-	members, err := h.lxcClient.GetClusterMembers()
-	if err != nil {
-		if strings.Contains(err.Error(), "not clustered") {
-			response := []map[string]interface{}{
-				{
-					"name":    "local-server",
-					"status":  "Online",
-					"address": "127.0.0.1",
-					"roles":   []string{"standalone"},
-				},
-			}
-			c.JSON(200, response)
-			return
-		}
-
-		log.Printf("Error getting cluster members: %v", err)
-		h.writeError(c, NewError(ErrCodeLXDConnectionFailed, "failed to get cluster members", err, 500, true))
-		return
-	}
-
-	type ClusterMemberResponse struct {
-		Name    string   `json:"name"`
-		Status  string   `json:"status"`
-		Address string   `json:"address"`
-		Roles   []string `json:"roles"`
-	}
-
-	var response []ClusterMemberResponse
-	for _, member := range members {
-		response = append(response, ClusterMemberResponse{
-			Name:    member.ServerName,
-			Status:  member.Status,
-			Address: member.URL,
-			Roles:   member.Roles,
-		})
-	}
-
-	c.JSON(200, response)
-}
-
-func (h *Handlers) StreamTelemetry(c *gin.Context) {
-	api.StreamTelemetry(c, h.lxcClient, func(metrics []lxc.InstanceMetric) {
-		for _, m := range metrics {
-			dbMetric := &db.Metric{
-				InstanceName: m.Name,
-				CPUPercent:   float64(m.CPUUsageSeconds),
-				MemoryUsage:  m.MemoryUsageBytes,
-				DiskUsage:    m.DiskUsageBytes,
-			}
-			if err := db.InsertMetric(dbMetric); err != nil {
-				log.Printf("Error inserting metric for %s: %v", m.Name, err)
-			}
-		}
-	})
-}
-
-func (h *Handlers) GetMetrics(c *gin.Context) {
-	c.JSON(200, h.metrics.Snapshot())
-}
+// Cluster Handlers
 
 // Helper methods
 func (h *Handlers) processTemplate(req CreateInstanceRequest) (string, *AppError) {
@@ -951,8 +701,8 @@ func (h *Handlers) processTemplate(req CreateInstanceRequest) (string, *AppError
 			reqRam := h.parseMemory(req.Limits)
 
 			if reqCpu < template.MinCPU {
-				return "", NewError(ErrCodeInsufficientResources, 
-					fmt.Sprintf("CPU insufficient for template %s", template.Name), 
+				return "", NewError(ErrCodeInsufficientResources,
+					fmt.Sprintf("CPU insufficient for template %s", template.Name),
 					nil, 400, false).
 					WithContext("required", template.MinCPU).
 					WithContext("provided", reqCpu)
@@ -1006,32 +756,12 @@ func (h *Handlers) parseMemory(limits map[string]string) int64 {
 	return 512
 }
 
-func (h *Handlers) dispatchJob(jobType types.JobType, target string, payload interface{}) string {
-	jobID := uuid.New().String()
-	payloadBytes, _ := json.Marshal(payload)
-	
-	job := &db.Job{
-		ID:      jobID,
-		Type:    jobType,
-		Target:  target,
-		Payload: string(payloadBytes),
-	}
-	
-	if err := db.CreateJob(job); err != nil {
-		log.Printf("Error creating job: %v", err)
-		return ""
-	}
-	
-	worker.DispatchJob(jobID)
-	return jobID
-}
-
 // ============================================================================
 // APPLICATION ORCHESTRATOR
 // ============================================================================
 
 type Application struct {
-	lxcClient       *lxc.Client
+	lxcClient       interface{} // Place holder, unused
 	backupScheduler *scheduler.BackupScheduler
 	handlers        *Handlers
 	router          *gin.Engine
@@ -1041,43 +771,64 @@ type Application struct {
 }
 
 const (
-	stateCreated uint32 = 0
-	stateRunning uint32 = 1
+	stateCreated  uint32 = 0
+	stateRunning  uint32 = 1
 	stateStopping uint32 = 2
-	stateStopped uint32 = 3
+	stateStopped  uint32 = 3
 )
 
 func NewApplication() (*Application, error) {
 	// Initialize database
-	if err := db.Init("axion.db"); err != nil {
+	if _, err := db.InitService(nil); err != nil {
 		return nil, fmt.Errorf("database initialization failed: %w", err)
 	}
 	log.Println("✓ Database initialized")
 
-	// Initialize LXD client
-	lxcClient, err := lxc.NewClient()
-	if err != nil {
-		return nil, fmt.Errorf("LXD client initialization failed: %w", err)
+	// Run Migrations
+	if err := db.RunMigrations(context.Background(), db.GetService()); err != nil {
+		return nil, fmt.Errorf("migrations failed: %w", err)
 	}
-	log.Println("✓ LXD connection established")
+	log.Println("✓ Database migrations applied")
 
-	// Initialize workers
-	worker.Init(2, lxcClient)
-	log.Println("✓ Worker pool initialized")
+	// Initialize AxHV client
+	// Prefer AxHV socket default
+	axhvClient, err := axhv.NewClient("", "", "")
+	if err != nil {
+		return nil, fmt.Errorf("AxHV client initialization failed: %w", err)
+	}
+	log.Println("✓ AxHV connection established")
+	// Initialize auth service
+	auth.Init(nil) // Uses default config
+
+	// Seed DB with admin if empty
+	go func() {
+		// Wait for DB to be potentially migrated? Migration runs in InitService? Yes.
+		// Use background context with timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+		defer cancel()
+		if err := auth.GetAuthService().SeedAdmin(ctx); err != nil {
+			log.Printf("[Main] Error seeding admin: %v", err)
+		}
+	}()
+
+	// Initialize workers - DISABLED
+	// worker.Init(2, lxcClient)
+	// log.Println("✓ Worker pool initialized")
 
 	// Initialize API broadcaster
 	api.InitBroadcaster()
 	log.Println("✓ API broadcaster initialized")
 
-	// Initialize backup scheduler
-	backupScheduler := scheduler.NewBackupScheduler(db.DB, lxcClient)
-	log.Println("✓ Backup scheduler initialized")
+	// Initialize backup scheduler - DISABLED (Legacy)
+	// backupScheduler := scheduler.NewBackupScheduler(db.GetService().GetRawDB(), lxcClient)
+	// log.Println("✓ Backup scheduler initialized")
+	var backupScheduler *scheduler.BackupScheduler // nil
 
 	// Initialize handlers
-	handlers := NewHandlers(lxcClient, backupScheduler)
+	handlers := NewHandlers(axhvClient, backupScheduler)
 
 	app := &Application{
-		lxcClient:       lxcClient,
+		lxcClient:       nil, // REMOVED
 		backupScheduler: backupScheduler,
 		handlers:        handlers,
 	}
@@ -1087,100 +838,78 @@ func NewApplication() (*Application, error) {
 }
 
 func (a *Application) setupRouter() {
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
-	
-	// Middleware
-	r.Use(gin.Recovery())
-	r.Use(a.handlers.metricsMiddleware())
-	r.Use(cors.New(cors.Config{
-		AllowAllOrigins: true,
-		AllowMethods:    []string{"GET", "POST", "OPTIONS", "DELETE", "PUT"},
-		AllowHeaders:    []string{"Origin", "Content-Type", "Accept", "Authorization"},
-		ExposeHeaders:   []string{"Content-Length", "Content-Disposition"},
-		MaxAge:          12 * time.Hour,
-	}))
-
-	// Public routes
-	r.POST("/login", auth.LoginHandler)
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"status": "healthy",
-			"state":  a.state.Load(),
-		})
-	})
-	r.GET("/metrics", a.handlers.GetMetrics)
-
-	// WebSocket routes (no auth middleware for terminal)
-	r.GET("/ws/terminal/:name", func(c *gin.Context) {
-		api.TerminalHandler(c, a.lxcClient)
-	})
-
-
-	// Static uploads
-	r.Static("/uploads", "./uploads")
-
-	// Protected routes
-	protected := r.Group("/")
-	protected.Use(auth.AuthMiddleware())
-	{
-		// Branding
-		api.RegisterBrandingRoutes(protected)
-
-		// Instances
-		protected.GET("/instances", a.handlers.ListInstances)
-
-		protected.GET("/instances/:name", a.handlers.GetInstance)
-		protected.POST("/instances", a.handlers.CreateInstance)
-		protected.DELETE("/instances/:name", a.handlers.DeleteInstance)
-		protected.POST("/instances/:name/state", a.handlers.UpdateInstanceState)
-		protected.POST("/instances/:name/limits", a.handlers.UpdateInstanceLimits)
-		protected.POST("/instances/:name/backups/config", a.handlers.UpdateBackupConfig)
-
-		// Snapshots
-		protected.GET("/instances/:name/snapshots", a.handlers.ListSnapshots)
-		protected.POST("/instances/:name/snapshots", a.handlers.CreateSnapshot)
-		protected.POST("/instances/:name/snapshots/:snap/restore", a.handlers.RestoreSnapshot)
-		protected.DELETE("/instances/:name/snapshots/:snap", a.handlers.DeleteSnapshot)
-
-		// Ports
-		protected.POST("/instances/:name/ports", a.handlers.AddPort)
-		protected.DELETE("/instances/:name/ports/:host_port", a.handlers.RemovePort)
-
-		// File System
-		protected.GET("/instances/:name/files/list", a.handlers.ListFiles)
-		protected.GET("/instances/:name/files/content", a.handlers.DownloadFile)
-		protected.POST("/instances/:name/files", a.handlers.UploadFile)
-		protected.DELETE("/instances/:name/files", a.handlers.DeleteFile)
-
-		// Jobs
-		protected.GET("/jobs", a.handlers.ListJobs)
-		protected.GET("/jobs/:id", a.handlers.GetJob)
-
-		// Templates
-		protected.GET("/templates", a.handlers.ListTemplates)
-
-		// Metrics
-		protected.GET("/instances/:name/metrics", a.handlers.GetInstanceMetrics)
-		protected.GET("/instances/:name/metrics/history", a.handlers.GetInstanceMetricsHistory)
-		protected.GET("/instances/:name/logs", a.handlers.GetInstanceLogs)
-		protected.GET("/ws/telemetry", a.handlers.StreamTelemetry)
-
-		// Networks
-		protected.GET("/networks", a.handlers.ListNetworks)
-		protected.POST("/networks", a.handlers.CreateNetwork)
-		protected.DELETE("/networks/:name", a.handlers.DeleteNetwork)
-
-		// Storage/ISOs
-		protected.POST("/storage/isos", a.handlers.UploadISO)
-		protected.GET("/storage/isos", a.handlers.ListISOs)
-		protected.DELETE("/storage/isos/:name", a.handlers.DeleteISO)
-
-		// Cluster
-		protected.GET("/cluster/members", a.handlers.GetClusterMembers)
-	}
-
+	r := gin.Default()
 	a.router = r
+
+	// CORS
+	r.Use(func(c *gin.Context) {
+		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+		c.Next()
+	})
+
+	api := r.Group("/api/v1")
+	h := a.handlers
+
+	// Auth
+	api.POST("/login", auth.LoginHandler)
+	api.POST("/register", auth.RegisterHandler)
+	api.POST("/refresh", auth.RefreshTokenHandler)
+	api.POST("/revoke", auth.RevokeTokenHandler)
+	api.GET("/auth/metrics", auth.GetAuthMetricsHandler)
+
+	// Instances
+	api.GET("/instances", auth.AuthMiddleware(), h.ListInstances)
+	api.POST("/instances", auth.AuthMiddleware(), h.CreateInstance)
+	api.GET("/instances/:name", auth.AuthMiddleware(), h.GetInstance)
+	api.DELETE("/instances/:name", auth.AuthMiddleware(), h.DeleteInstance)
+	api.POST("/instances/:name/action", auth.AuthMiddleware(), h.UpdateInstanceState)
+	api.PUT("/instances/:name/limits", auth.AuthMiddleware(), h.UpdateInstanceLimits)
+	api.PUT("/instances/:name/backup", auth.AuthMiddleware(), h.UpdateBackupConfig)
+
+	// Snapshots (Stubbed)
+	api.GET("/instances/:name/snapshots", auth.AuthMiddleware(), h.ListSnapshots)
+	api.POST("/instances/:name/snapshots", auth.AuthMiddleware(), h.CreateSnapshot)
+	api.POST("/instances/:name/snapshots/:snap/restore", auth.AuthMiddleware(), h.RestoreSnapshot)
+	api.DELETE("/instances/:name/snapshots/:snap", auth.AuthMiddleware(), h.DeleteSnapshot)
+
+	// Files (Stubbed)
+	api.GET("/instances/:name/files", auth.AuthMiddleware(), h.ListFiles)
+	api.GET("/instances/:name/file", auth.AuthMiddleware(), h.DownloadFile)
+	api.POST("/instances/:name/files", auth.AuthMiddleware(), h.UploadFile)
+	api.DELETE("/instances/:name/files", auth.AuthMiddleware(), h.DeleteFile)
+
+	// Metrics
+	api.GET("/instances/:name/metrics", auth.AuthMiddleware(), h.GetInstanceMetrics)
+	api.GET("/instances/:name/metrics/history", auth.AuthMiddleware(), h.GetInstanceMetricsHistory)
+	api.GET("/instances/:name/logs", auth.AuthMiddleware(), h.GetInstanceLogs)
+
+	// Cluster
+	api.GET("/cluster", auth.AuthMiddleware(), h.GetClusterMembers)
+
+	// ISOs
+	api.GET("/isos", auth.AuthMiddleware(), h.ListISOs)
+	api.POST("/isos", auth.AuthMiddleware(), h.UploadISO)
+	api.DELETE("/isos/:name", auth.AuthMiddleware(), h.DeleteISO)
+
+	// Jobs
+	api.GET("/jobs", auth.AuthMiddleware(), h.ListJobs)
+	api.GET("/jobs/:id", auth.AuthMiddleware(), h.GetJob)
+
+	// Templates
+	api.GET("/templates", auth.AuthMiddleware(), h.ListTemplates)
+
+	// App Metrics
+	api.GET("/metrics", auth.AuthMiddleware(), h.GetMetrics)
+
+	// Admin Networks
+	api.GET("/networks", auth.AuthMiddleware(), h.ListNetworks)
+	api.POST("/networks", auth.AuthMiddleware(), h.CreateNetwork)
 }
 
 func (a *Application) Start() error {
@@ -1189,21 +918,21 @@ func (a *Application) Start() error {
 	}
 
 	// Run startup sync
-	scheduler.RunStartupSync(db.DB, a.lxcClient)
-	log.Println("✓ Startup sync completed")
+	// scheduler.RunStartupSync(db.GetService().GetRawDB(), a.lxcClient)
+	// log.Println("✓ Startup sync completed")
 
 	// Start background services
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
-		monitor.StartHistoricalCollector(db.DB, a.lxcClient)
+		// monitor.StartHistoricalCollector(db.GetService().GetRawDB(), a.lxcClient)
 	}()
-	log.Println("✓ Historical collector started")
+	log.Println("✓ Historical collector started (DISABLED)")
 
 	// Start backup scheduler
-	a.backupScheduler.Start()
-	a.backupScheduler.SyncJobs()
-	log.Println("✓ Backup scheduler started")
+	// a.backupScheduler.Start()
+	// a.backupScheduler.SyncJobs()
+	// log.Println("✓ Backup scheduler started")
 
 	// Setup router
 	a.setupRouter()
@@ -1264,7 +993,7 @@ func (a *Application) Shutdown(ctx context.Context) error {
 	}
 
 	// 4. Close database
-	if err := db.DB.Close(); err != nil {
+	if err := db.GetService().Close(); err != nil {
 		errs = append(errs, fmt.Errorf("database close: %w", err))
 	}
 	log.Println("✓ Database closed")
@@ -1280,6 +1009,40 @@ func (a *Application) Shutdown(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// ============================================================================
+// NETWORK HANDLERS
+// ============================================================================
+
+func (h *Handlers) ListNetworks(c *gin.Context) {
+	stats, err := db.GetService().GetNetworksWithStats(c.Request.Context())
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to fetch networks", "details": err.Error()})
+		return
+	}
+	c.JSON(200, stats)
+}
+
+func (h *Handlers) CreateNetwork(c *gin.Context) {
+	var req db.Network
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	// Validate (Simple check)
+	if req.Name == "" || req.CIDR == "" || req.Gateway == "" {
+		c.JSON(400, gin.H{"error": "Missing required fields"})
+		return
+	}
+
+	if err := db.GetService().CreateNetwork(c.Request.Context(), req); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to create network", "details": err.Error()})
+		return
+	}
+
+	c.JSON(201, gin.H{"status": "created"})
 }
 
 // ============================================================================

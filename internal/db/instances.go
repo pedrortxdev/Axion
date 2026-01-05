@@ -1,5 +1,5 @@
 // database/instances.go
-package database
+package db
 
 import (
 	"context"
@@ -7,12 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
-	"time"
 
-	"aexon/internal/provider/lxc"
 	"aexon/internal/types"
-	"aexon/internal/utils"
 )
 
 // ============================================================================
@@ -20,10 +16,10 @@ import (
 // ============================================================================
 
 type InstanceRepository struct {
-	db *DB
+	db *Service
 }
 
-func NewInstanceRepository(db *DB) *InstanceRepository {
+func NewInstanceRepository(db *Service) *InstanceRepository {
 	return &InstanceRepository{db: db}
 }
 
@@ -288,92 +284,6 @@ func (r *InstanceRepository) GetWithBackupInfo(ctx context.Context, name string,
 // HARDWARE INFO ENRICHMENT
 // ============================================================================
 
-func (r *InstanceRepository) GetWithHardwareInfo(ctx context.Context, name string, lxdClient *lxc.InstanceService) (*types.Instance, error) {
-	instance, err := r.Get(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get LXD instance details
-	inst, _, err := lxdClient.Server().GetInstance(name)
-	if err != nil {
-		log.Printf("[Instances] Error getting LXD info for %s: %v", name, err)
-		return instance, nil // Return instance with basic info
-	}
-
-	// Extract node location
-	if inst.Location != "" {
-		instance.Node = inst.Location
-	} else {
-		hostname, err := os.Hostname()
-		if err != nil {
-			instance.Node = "local"
-		} else {
-			instance.Node = hostname
-		}
-	}
-
-	// Extract CPU count
-	if cpuLimit, ok := inst.Config["limits.cpu"]; ok {
-		instance.CPUCount = utils.ParseCpuCores(cpuLimit)
-	} else {
-		instance.CPUCount = 1
-	}
-
-	// Extract disk limit from ExpandedDevices or Devices
-	if rootDevice, ok := inst.ExpandedDevices["root"]; ok {
-		if size, exists := rootDevice["size"]; exists {
-			instance.DiskLimit = utils.ParseMemoryToBytes(size)
-		}
-	} else if rootDevice, ok := inst.Devices["root"]; ok {
-		if size, exists := rootDevice["size"]; exists {
-			instance.DiskLimit = utils.ParseMemoryToBytes(size)
-		}
-	}
-
-	// Fallback to limits if no device size
-	if instance.DiskLimit == 0 {
-		if diskLimit, ok := inst.Config["limits.disk"]; ok {
-			instance.DiskLimit = utils.ParseMemoryToBytes(diskLimit)
-		}
-	}
-
-	// Get state for disk usage and IP
-	state, _, stateErr := lxdClient.Server().GetInstanceState(name)
-	if stateErr == nil {
-		// Disk usage
-		if rootDisk, ok := state.Disk["root"]; ok {
-			instance.DiskUsage = rootDisk.Usage
-		}
-
-		// Smart IP discovery
-		if instance.Limits == nil {
-			instance.Limits = make(map[string]string)
-		}
-
-		for _, networkInfo := range state.Network {
-			if networkInfo.Type == "broadcast" {
-				for _, addr := range networkInfo.Addresses {
-					if addr.Family == "inet" {
-						instance.Limits["volatile.ip_address"] = addr.Address
-						break
-					}
-				}
-				if instance.Limits["volatile.ip_address"] != "" {
-					break
-				}
-			}
-		}
-	}
-
-	// Update limits in database with IP if found
-	if instance.Limits["volatile.ip_address"] != "" {
-		r.UpdateLimits(ctx, name, instance.Limits)
-	}
-
-	return instance, nil
-}
-
 // ============================================================================
 // LIMITS UPDATE
 // ============================================================================
@@ -601,42 +511,36 @@ func (r *InstanceRepository) ListWithBackupEnabled(ctx context.Context) ([]types
 
 func CreateInstance(instance *types.Instance) error {
 	ctx := context.Background()
-	repo := NewInstanceRepository(GetDB())
+	repo := NewInstanceRepository(GetService())
 	return repo.Create(ctx, instance)
 }
 
 func GetInstance(name string) (*types.Instance, error) {
 	ctx := context.Background()
-	repo := NewInstanceRepository(GetDB())
+	repo := NewInstanceRepository(GetService())
 	return repo.Get(ctx, name)
 }
 
 func ListInstances() ([]types.Instance, error) {
 	ctx := context.Background()
-	repo := NewInstanceRepository(GetDB())
+	repo := NewInstanceRepository(GetService())
 	return repo.List(ctx)
 }
 
 func DeleteInstance(name string) error {
 	ctx := context.Background()
-	repo := NewInstanceRepository(GetDB())
+	repo := NewInstanceRepository(GetService())
 	return repo.Delete(ctx, name)
 }
 
 func UpdateInstanceBackupConfig(name string, enabled bool, schedule string, retention int) error {
 	ctx := context.Background()
-	repo := NewInstanceRepository(GetDB())
+	repo := NewInstanceRepository(GetService())
 	return repo.UpdateBackupConfig(ctx, name, enabled, schedule, retention)
-}
-
-func GetInstanceWithHardwareInfo(name string, lxdClient *lxc.InstanceService) (*types.Instance, error) {
-	ctx := context.Background()
-	repo := NewInstanceRepository(GetDB())
-	return repo.GetWithHardwareInfo(ctx, name, lxdClient)
 }
 
 func UpdateInstanceStatusAndLimits(name string, limits map[string]string) error {
 	ctx := context.Background()
-	repo := NewInstanceRepository(GetDB())
+	repo := NewInstanceRepository(GetService())
 	return repo.UpdateLimits(ctx, name, limits)
 }

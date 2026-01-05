@@ -63,8 +63,8 @@ const CONTAINER_IMAGES = [
 ];
 
 const VM_IMAGES = [
-  { value: 'ubuntu/24.04', label: 'Ubuntu 24.04 LTS (VM)' },
-  { value: 'debian/12', label: 'Debian 12 (VM)' },
+  { value: 'ubuntu', label: 'Ubuntu 24.04 LTS' },
+  { value: 'alpine', label: 'Alpine 3.20' },
 ];
 
 export default function CreateInstanceModal({ isOpen, onClose, token, initialType = 'container' }: CreateInstanceModalProps) {
@@ -88,6 +88,9 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
   const [isoImages, setIsoImages] = useState<IsoImage[]>([]);
   const [selectedIso, setSelectedIso] = useState<string>('');
 
+  // Port Forwarding State
+  const [ports, setPorts] = useState<{ ext: number; int: number }[]>([{ ext: 0, int: 22 }]);
+
   interface IsoImage {
     name: string;
     size: number;
@@ -96,23 +99,26 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
   // Update defaults when initialType changes or modal opens
   useEffect(() => {
     if (isOpen) {
-        setType(initialType);
-        setImage(initialType === 'container' ? CONTAINER_IMAGES[0].value : VM_IMAGES[0].value);
-        // Reset fields
-        setName('');
-        setCpu(1);
-        setMemory(initialType === 'container' ? 256 : 1024); // VMs need more RAM usually
-        setUsername('admin');
-        setPassword('');
-        setTemplateId('none');
-        setUserData('');
-        setShowAdvanced(false);
-        setSelectedTemplate(null);
-        setInstallMethod('template');
-        setSelectedIso('');
+      setType(initialType);
+      setImage(initialType === 'container' ? CONTAINER_IMAGES[0].value : VM_IMAGES[0].value);
+      // Reset fields
+      setName('');
+      setCpu(1);
+      setMemory(initialType === 'container' ? 256 : 1024); // VMs need more RAM usually
+      setUsername('admin');
+      setPassword('');
+      setTemplateId('none');
+      setUserData('');
+      setShowAdvanced(false);
+      setSelectedTemplate(null);
+      setInstallMethod('template');
+      setSelectedTemplate(null);
+      setInstallMethod('template');
+      setSelectedIso('');
+      setPorts([{ ext: 0, int: 22 }]); // Reset ports
     }
   }, [isOpen, initialType]);
-  
+
   const fetchTemplates = React.useCallback(async () => {
     if (!token) return;
 
@@ -143,27 +149,27 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
   const fetchIsoImages = React.useCallback(async () => {
     if (!token) return;
     try {
-        const protocol = window.location.protocol;
-        const host = window.location.hostname;
-        const port = '8500';
-        const response = await fetch(`${protocol}//${host}:${port}/isos`, {
-            headers: {
-                'Authorization': `Bearer ${token}`
-            },
-        });
-        if (response.ok) {
-            const data = await response.json();
-            setIsoImages(data || []);
-            if (data && data.length > 0) {
-              setSelectedIso(data[0].name);
-            }
-        } else {
-            toast.error('Failed to load ISOs', { description: 'Could not fetch available ISO images' });
+      const protocol = window.location.protocol;
+      const host = window.location.hostname;
+      const port = '8500';
+      const response = await fetch(`${protocol}//${host}:${port}/isos`, {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        },
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setIsoImages(data || []);
+        if (data && data.length > 0) {
+          setSelectedIso(data[0].name);
         }
+      } else {
+        toast.error('Failed to load ISOs', { description: 'Could not fetch available ISO images' });
+      }
     } catch (error) {
-        toast.error('Network Error', { description: 'Could not reach control plane for ISOs' });
+      toast.error('Network Error', { description: 'Could not reach control plane for ISOs' });
     }
-}, [token]);
+  }, [token]);
 
 
   // Fetch templates when modal opens
@@ -285,14 +291,14 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
 
     // Specific validation for VM
     if (type === 'virtual-machine') {
-        if (!username.trim()) {
-            toast.error('Invalid Username', { description: 'Username is required for VMs.' });
-            return;
-        }
-        if (!password.trim()) {
-            toast.error('Invalid Password', { description: 'Password is required for VMs.' });
-            return;
-        }
+      if (!username.trim()) {
+        toast.error('Invalid Username', { description: 'Username is required for VMs.' });
+        return;
+      }
+      if (!password.trim()) {
+        toast.error('Invalid Password', { description: 'Password is required for VMs.' });
+        return;
+      }
     }
 
     setIsLoading(true);
@@ -327,7 +333,14 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
         }
       }
 
-      const response = await fetch(`${protocol}//${host}:${port}/instances`, {
+      // Add Ports to limits (Comma separated string: "2202:22,8080:80")
+      // Filter out invalid ports
+      const validPorts = ports.filter(p => p.ext > 0 && p.int > 0);
+      if (validPorts.length > 0) {
+        payload.limits["ports"] = validPorts.map(p => `${p.ext}:${p.int}`).join(',');
+      }
+
+      const response = await fetch(`${protocol}//${host}:${port}/api/v1/instances`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -387,21 +400,19 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
             <div className="flex border-b border-zinc-800">
               <button
                 onClick={() => setActiveTab('config')}
-                className={`px-4 py-2 text-sm font-medium transition-colors ${
-                  activeTab === 'config'
-                    ? 'text-zinc-200 border-b-2 border-indigo-500'
-                    : 'text-zinc-500 hover:text-zinc-300'
-                }`}
+                className={`px-4 py-2 text-sm font-medium transition-colors ${activeTab === 'config'
+                  ? 'text-zinc-200 border-b-2 border-indigo-500'
+                  : 'text-zinc-500 hover:text-zinc-300'
+                  }`}
               >
                 Manual Configuration
               </button>
               <button
                 onClick={() => setActiveTab('templates')}
-                className={`px-4 py-2 text-sm font-medium transition-colors ${
-                  activeTab === 'templates'
-                    ? 'text-zinc-200 border-b-2 border-indigo-500'
-                    : 'text-zinc-500 hover:text-zinc-300'
-                }`}
+                className={`px-4 py-2 text-sm font-medium transition-colors ${activeTab === 'templates'
+                  ? 'text-zinc-200 border-b-2 border-indigo-500'
+                  : 'text-zinc-500 hover:text-zinc-300'
+                  }`}
               >
                 App Templates
               </button>
@@ -418,18 +429,18 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
 
                   {type === 'virtual-machine' && (
                     <div className="flex items-center gap-2 bg-zinc-900/50 border border-zinc-800 rounded-lg p-1 w-max">
-                        <button 
-                            onClick={() => setInstallMethod('template')}
-                            className={`px-3 py-1.5 text-xs rounded-md transition-colors ${installMethod === 'template' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:text-zinc-200'}`}
-                        >
-                            From Template
-                        </button>
-                        <button 
-                            onClick={() => setInstallMethod('iso')}
-                            className={`px-3 py-1.5 text-xs rounded-md transition-colors ${installMethod === 'iso' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:text-zinc-200'}`}
-                        >
-                            From ISO
-                        </button>
+                      <button
+                        onClick={() => setInstallMethod('template')}
+                        className={`px-3 py-1.5 text-xs rounded-md transition-colors ${installMethod === 'template' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:text-zinc-200'}`}
+                      >
+                        From Template
+                      </button>
+                      <button
+                        onClick={() => setInstallMethod('iso')}
+                        className={`px-3 py-1.5 text-xs rounded-md transition-colors ${installMethod === 'iso' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:text-zinc-200'}`}
+                      >
+                        From ISO
+                      </button>
                     </div>
                   )}
 
@@ -447,46 +458,46 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
                     </div>
 
                     {installMethod === 'iso' ? (
-                        <div>
-                            <label className="block text-xs font-medium text-zinc-400 mb-1.5 uppercase tracking-wider">ISO Image</label>
-                            <div className="relative">
-                                <select
-                                    value={selectedIso}
-                                    onChange={(e) => setSelectedIso(e.target.value)}
-                                    className="w-full bg-zinc-900/50 border border-zinc-800 text-zinc-200 rounded-lg px-4 py-2.5 appearance-none focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 transition-all cursor-pointer"
-                                    disabled={isoImages.length === 0}
-                                >
-                                    {isoImages.length > 0 ? (
-                                        isoImages.map(iso => (
-                                            <option key={iso.name} value={iso.name}>{iso.name}</option>
-                                        ))
-                                    ) : (
-                                        <option>No ISOs available</option>
-                                    )}
-                                </select>
-                                <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-zinc-500">
-                                    <FileUp size={16} />
-                                </div>
-                            </div>
+                      <div>
+                        <label className="block text-xs font-medium text-zinc-400 mb-1.5 uppercase tracking-wider">ISO Image</label>
+                        <div className="relative">
+                          <select
+                            value={selectedIso}
+                            onChange={(e) => setSelectedIso(e.target.value)}
+                            className="w-full bg-zinc-900/50 border border-zinc-800 text-zinc-200 rounded-lg px-4 py-2.5 appearance-none focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 transition-all cursor-pointer"
+                            disabled={isoImages.length === 0}
+                          >
+                            {isoImages.length > 0 ? (
+                              isoImages.map(iso => (
+                                <option key={iso.name} value={iso.name}>{iso.name}</option>
+                              ))
+                            ) : (
+                              <option>No ISOs available</option>
+                            )}
+                          </select>
+                          <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-zinc-500">
+                            <FileUp size={16} />
+                          </div>
                         </div>
+                      </div>
                     ) : (
-                        <div>
-                            <label className="block text-xs font-medium text-zinc-400 mb-1.5 uppercase tracking-wider">Image</label>
-                            <div className="relative">
-                                <select
-                                    value={image}
-                                    onChange={(e) => setImage(e.target.value)}
-                                    className="w-full bg-zinc-900/50 border border-zinc-800 text-zinc-200 rounded-lg px-4 py-2.5 appearance-none focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 transition-all cursor-pointer"
-                                >
-                                    {imagesList.map(img => (
-                                        <option key={img.value} value={img.value}>{img.label}</option>
-                                    ))}
-                                </select>
-                                <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-zinc-500">
-                                    <Server size={16} />
-                                </div>
-                            </div>
+                      <div>
+                        <label className="block text-xs font-medium text-zinc-400 mb-1.5 uppercase tracking-wider">Image</label>
+                        <div className="relative">
+                          <select
+                            value={image}
+                            onChange={(e) => setImage(e.target.value)}
+                            className="w-full bg-zinc-900/50 border border-zinc-800 text-zinc-200 rounded-lg px-4 py-2.5 appearance-none focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 transition-all cursor-pointer"
+                          >
+                            {imagesList.map(img => (
+                              <option key={img.value} value={img.value}>{img.label}</option>
+                            ))}
+                          </select>
+                          <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-zinc-500">
+                            <Server size={16} />
+                          </div>
                         </div>
+                      </div>
                     )}
                   </div>
                 </div>
@@ -534,21 +545,21 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
 
                     {/* Disk */}
                     {type === 'virtual-machine' && (
-                        <div>
-                            <div className="flex justify-between items-center mb-2">
-                                <span className="text-xs text-zinc-400">Disk Size</span>
-                                <span className="text-xs font-mono text-indigo-400 bg-indigo-500/10 px-2 py-0.5 rounded border border-indigo-500/20">{disk} GB</span>
-                            </div>
-                            <input
-                                type="range"
-                                min="10"
-                                max="100"
-                                step="5"
-                                value={disk}
-                                onChange={(e) => setDisk(parseInt(e.target.value))}
-                                className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-indigo-500 hover:accent-indigo-400"
-                            />
+                      <div>
+                        <div className="flex justify-between items-center mb-2">
+                          <span className="text-xs text-zinc-400">Disk Size</span>
+                          <span className="text-xs font-mono text-indigo-400 bg-indigo-500/10 px-2 py-0.5 rounded border border-indigo-500/20">{disk} GB</span>
                         </div>
+                        <input
+                          type="range"
+                          min="10"
+                          max="100"
+                          step="5"
+                          value={disk}
+                          onChange={(e) => setDisk(parseInt(e.target.value))}
+                          className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-indigo-500 hover:accent-indigo-400"
+                        />
+                      </div>
                     )}
                   </div>
                 </div>
@@ -561,124 +572,208 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
 
                   <div className="space-y-4">
                     {type === 'virtual-machine' ? (
-                        <div className="grid grid-cols-2 gap-4">
-                          <div>
-                            <label className="block text-xs font-medium text-zinc-400 mb-1.5 uppercase tracking-wider">Username</label>
-                            <div className="relative">
-                              <input
-                                type="text"
-                                value={username}
-                                onChange={(e) => setUsername(e.target.value)}
-                                placeholder="admin"
-                                className="w-full bg-zinc-900/50 border border-zinc-800 text-zinc-200 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 transition-all placeholder:text-zinc-600 pl-10"
-                              />
-                              <div className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500">
-                                <User size={16} />
-                              </div>
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-xs font-medium text-zinc-400 mb-1.5 uppercase tracking-wider">Username</label>
+                          <div className="relative">
+                            <input
+                              type="text"
+                              value={username}
+                              onChange={(e) => setUsername(e.target.value)}
+                              placeholder="admin"
+                              className="w-full bg-zinc-900/50 border border-zinc-800 text-zinc-200 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 transition-all placeholder:text-zinc-600 pl-10"
+                            />
+                            <div className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500">
+                              <User size={16} />
                             </div>
                           </div>
+                        </div>
 
-                          <div>
-                            <label className="block text-xs font-medium text-zinc-400 mb-1.5 uppercase tracking-wider">Password</label>
-                            <div className="relative">
-                              <input
-                                type="password"
-                                value={password}
-                                onChange={(e) => setPassword(e.target.value)}
-                                placeholder="••••••••"
-                                className="w-full bg-zinc-900/50 border border-zinc-800 text-zinc-200 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 transition-all placeholder:text-zinc-600 pl-10"
-                              />
-                              <div className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500">
-                                <Key size={16} />
-                              </div>
+                        <div>
+                          <label className="block text-xs font-medium text-zinc-400 mb-1.5 uppercase tracking-wider">Password</label>
+                          <div className="relative">
+                            <input
+                              type="password"
+                              value={password}
+                              onChange={(e) => setPassword(e.target.value)}
+                              placeholder="••••••••"
+                              className="w-full bg-zinc-900/50 border border-zinc-800 text-zinc-200 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 transition-all placeholder:text-zinc-600 pl-10"
+                            />
+                            <div className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500">
+                              <Key size={16} />
                             </div>
                           </div>
                         </div>
+                      </div>
                     ) : (
-                        <div className="p-3 bg-zinc-900/30 border border-zinc-800 rounded-lg flex items-center gap-3">
-                            <User size={16} className="text-zinc-500" />
-                            <span className="text-sm text-zinc-400">Authentication is disabled for Containers (System Container).</span>
-                        </div>
+                      <div className="p-3 bg-zinc-900/30 border border-zinc-800 rounded-lg flex items-center gap-3">
+                        <User size={16} className="text-zinc-500" />
+                        <span className="text-sm text-zinc-400">Authentication is disabled for Containers (System Container).</span>
+                      </div>
                     )}
 
                     <div>
                       <label className="block text-xs font-medium text-zinc-400 mb-1.5 uppercase tracking-wider">Network</label>
-                      <div className="inline-flex items-center px-3 py-1.5 bg-zinc-900/50 border border-zinc-800 rounded-lg text-xs text-zinc-400">
-                        <Network size={12} className="mr-1.5" />
-                        DHCP (Managed by LXD)
+                      <div className="bg-zinc-900/50 border border-zinc-800 rounded-lg p-3 flex items-start gap-3">
+                        <div className="mt-0.5 text-emerald-500">
+                          <Network size={16} />
+                        </div>
+                        <div>
+                          <div className="text-sm font-medium text-zinc-200 flex items-center gap-2">
+                            Auto-Allocated IP
+                            <span className="text-[10px] bg-emerald-500/10 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/20">SMART IPAM</span>
+                          </div>
+                          <p className="text-xs text-zinc-500 mt-1">
+                            System will automatically select the best available IP from private pools (e.g., 172.16.x.x).
+                          </p>
+                        </div>
                       </div>
                     </div>
                   </div>
                 </div>
 
+
+                {/* Port Forwarding (New AxHV Feature) */}
+                <div className="space-y-4">
+                  <h3 className="text-sm font-medium text-zinc-300 flex items-center gap-2">
+                    <Network size={16} className="text-zinc-500" /> Port Forwarding <span className="text-[10px] bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 px-1.5 py-0.5 rounded ml-2">FREE TIER</span>
+                  </h3>
+
+                  <div className="bg-zinc-900/30 p-4 rounded-xl border border-zinc-800/50 space-y-4">
+
+                    {/* Free Tier Warning */}
+                    <div className="bg-blue-900/10 border border-blue-900/30 rounded-lg p-3 flex gap-3 text-xs text-blue-300">
+                      <Zap size={14} className="mt-0.5 flex-shrink-0" />
+                      <div>
+                        <p className="font-semibold">Free Tier Plan</p>
+                        <p className="opacity-80">Limits: 10Mbps Bandwidth, Max 3 Port Mapping Rules.</p>
+                      </div>
+                    </div>
+
+                    <div className="space-y-2">
+                      {ports.map((port, idx) => (
+                        <div key={idx} className="flex items-center gap-3">
+                          <div className="flex-1">
+                            <label className="text-[10px] text-zinc-500 mb-1 block">Host Port</label>
+                            <input
+                              type="number"
+                              value={port.ext || ''}
+                              onChange={e => {
+                                const newPorts = [...ports];
+                                newPorts[idx].ext = parseInt(e.target.value);
+                                setPorts(newPorts);
+                              }}
+                              placeholder="Random"
+                              className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-sm text-zinc-300 focus:border-indigo-500/50 outline-none"
+                            />
+                          </div>
+                          <div className="text-zinc-600 mt-5">→</div>
+                          <div className="flex-1">
+                            <label className="text-[10px] text-zinc-500 mb-1 block">Guest Port</label>
+                            <input
+                              type="number"
+                              value={port.int}
+                              onChange={e => {
+                                const newPorts = [...ports];
+                                newPorts[idx].int = parseInt(e.target.value);
+                                setPorts(newPorts);
+                              }}
+                              placeholder="22"
+                              className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-sm text-zinc-300 focus:border-indigo-500/50 outline-none"
+                            />
+                          </div>
+                          <button
+                            onClick={() => {
+                              const newPorts = ports.filter((_, i) => i !== idx);
+                              setPorts(newPorts);
+                            }}
+                            className="mt-5 p-1.5 text-zinc-500 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
+                          >
+                            <X size={14} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+
+                    {ports.length < 3 && (
+                      <button
+                        onClick={() => setPorts([...ports, { ext: 0, int: 0 }])}
+                        className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1 mt-2"
+                      >
+                        + Add Port Rule
+                      </button>
+                    )}
+                  </div>
+                </div>
+
                 {/* Templates */}
                 {installMethod === 'template' && (
-                    <div className="space-y-4">
+                  <div className="space-y-4">
                     <h3 className="text-sm font-medium text-zinc-300 flex items-center gap-2">
-                        <FileCode size={16} className="text-zinc-500" /> Cloud-Init Template
+                      <FileCode size={16} className="text-zinc-500" /> Cloud-Init Template
                     </h3>
 
                     <div className="space-y-4">
-                        <div>
+                      <div>
                         <label className="block text-xs font-medium text-zinc-400 mb-1.5">Select Template</label>
                         <div className="grid grid-cols-2 gap-3">
-                            {LEGACY_TEMPLATES.map(tmpl => (
+                          {LEGACY_TEMPLATES.map(tmpl => (
                             <button
-                                key={tmpl.id}
-                                type="button"
-                                onClick={() => {
+                              key={tmpl.id}
+                              type="button"
+                              onClick={() => {
                                 setTemplateId(tmpl.id);
                                 setSelectedTemplate(null); // Reset new template selection
-                                }}
-                                className={`
+                              }}
+                              className={`
                                 text-left p-3 rounded-lg border transition-all relative overflow-hidden
                                 ${templateId === tmpl.id
-                                    ? 'bg-indigo-600/10 border-indigo-500/50 ring-1 ring-indigo-500/20'
-                                    : 'bg-zinc-900/30 border-zinc-800 hover:bg-zinc-900 hover:border-zinc-700'
+                                  ? 'bg-indigo-600/10 border-indigo-500/50 ring-1 ring-indigo-500/20'
+                                  : 'bg-zinc-900/30 border-zinc-800 hover:bg-zinc-900 hover:border-zinc-700'
                                 }
                                 `}
                             >
-                                <div className="flex justify-between items-start mb-1">
+                              <div className="flex justify-between items-start mb-1">
                                 <span className={`text-sm font-medium ${templateId === tmpl.id ? 'text-indigo-400' : 'text-zinc-300'}`}>
-                                    {tmpl.label}
+                                  {tmpl.label}
                                 </span>
                                 {templateId === tmpl.id && <div className="h-2 w-2 rounded-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.6)]"></div>}
-                                </div>
-                                <p className="text-[11px] text-zinc-500 leading-tight">{tmpl.description}</p>
+                              </div>
+                              <p className="text-[11px] text-zinc-500 leading-tight">{tmpl.description}</p>
                             </button>
-                            ))}
+                          ))}
                         </div>
-                        </div>
+                      </div>
 
-                        {/* YAML Editor */}
-                        <div>
+                      {/* YAML Editor */}
+                      <div>
                         <div className="flex justify-between items-center mb-2">
-                            <label className="text-xs font-medium text-zinc-400">Resulting YAML (Preview)</label>
-                            <button
+                          <label className="text-xs font-medium text-zinc-400">Resulting YAML (Preview)</label>
+                          <button
                             type="button"
                             onClick={() => setShowAdvanced(!showAdvanced)}
                             className="text-xs text-zinc-500 hover:text-indigo-400 flex items-center gap-1 transition-colors"
-                            >
+                          >
                             <Code size={12} />
                             {showAdvanced ? 'Hide Editor' : 'Edit YAML'}
-                            </button>
+                          </button>
                         </div>
 
                         {showAdvanced ? (
-                            <textarea
+                          <textarea
                             value={userData}
                             onChange={(e) => setUserData(e.target.value)}
                             className="w-full h-48 bg-black/50 border border-zinc-800 rounded-lg p-3 font-mono text-xs text-zinc-300 focus:outline-none focus:border-indigo-500/50 resize-y"
                             placeholder="#cloud-config..."
-                            />
+                          />
                         ) : (
-                            <div className="w-full h-48 bg-black/50 border border-zinc-800 rounded-lg p-3 font-mono text-xs text-zinc-300 overflow-y-auto whitespace-pre-wrap overflow-x-auto">
+                          <div className="w-full h-48 bg-black/50 border border-zinc-800 rounded-lg p-3 font-mono text-xs text-zinc-300 overflow-y-auto whitespace-pre-wrap overflow-x-auto">
                             {userData || <span className="text-zinc-600 italic">Select a template or enable editor to view YAML</span>}
-                            </div>
+                          </div>
                         )}
-                        </div>
+                      </div>
                     </div>
-                    </div>
+                  </div>
                 )}
               </>
             ) : (
@@ -781,7 +876,7 @@ export default function CreateInstanceModal({ isOpen, onClose, token, initialTyp
           </div>
 
         </div>
-      </div>
+      </div >
     </>
   );
 }

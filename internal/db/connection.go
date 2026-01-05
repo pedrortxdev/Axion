@@ -1,5 +1,5 @@
 // database/connection.go
-package database
+package db
 
 import (
 	"context"
@@ -177,7 +177,7 @@ func (m *DBMetrics) Snapshot() map[string]interface{} {
 // DATABASE SERVICE
 // ============================================================================
 
-type DB struct {
+type Service struct {
 	db      *sql.DB
 	config  *Config
 	metrics *DBMetrics
@@ -194,11 +194,11 @@ const (
 )
 
 var (
-	globalDB   *DB
-	globalOnce sync.Once
+	globalService *Service
+	globalOnce    sync.Once
 )
 
-func Init(cfg *Config) (*DB, error) {
+func InitService(cfg *Config) (*Service, error) {
 	var initErr error
 	
 	globalOnce.Do(func() {
@@ -211,7 +211,7 @@ func Init(cfg *Config) (*DB, error) {
 			return
 		}
 
-		globalDB, initErr = connect(cfg)
+		globalService, initErr = connect(cfg)
 		if initErr != nil {
 			return
 		}
@@ -223,22 +223,22 @@ func Init(cfg *Config) (*DB, error) {
 		return nil, initErr
 	}
 
-	return globalDB, nil
+	return globalService, nil
 }
 
-func GetDB() *DB {
-	if globalDB == nil {
-		log.Println("[DB] WARNING: GetDB called before Init()")
-		db, err := Init(nil)
+func GetService() *Service {
+	if globalService == nil {
+		log.Println("[DB] WARNING: GetService called before InitService()")
+		db, err := InitService(nil)
 		if err != nil {
 			log.Fatalf("[DB] FATAL: Failed to initialize: %v", err)
 		}
 		return db
 	}
-	return globalDB
+	return globalService
 }
 
-func connect(cfg *Config) (*DB, error) {
+func connect(cfg *Config) (*Service, error) {
 	db, err := sql.Open("postgres", cfg.DSN())
 	if err != nil {
 		return nil, NewDBError(ErrCodeConnectionFailed, "sql.Open failed", err)
@@ -259,7 +259,7 @@ func connect(cfg *Config) (*DB, error) {
 		return nil, NewDBError(ErrCodePingFailed, "ping failed", err)
 	}
 
-	service := &DB{
+	service := &Service{
 		db:      db,
 		config:  cfg,
 		metrics: &DBMetrics{},
@@ -269,27 +269,31 @@ func connect(cfg *Config) (*DB, error) {
 	return service, nil
 }
 
-func (d *DB) Ping(ctx context.Context) error {
-	if d.state.Load() != stateConnected {
+func (s *Service) GetRawDB() *sql.DB {
+	return s.db
+}
+
+func (s *Service) Ping(ctx context.Context) error {
+	if s.state.Load() != stateConnected {
 		return NewDBError(ErrCodeConnectionFailed, "not connected", nil)
 	}
 
-	if err := d.db.PingContext(ctx); err != nil {
+	if err := s.db.PingContext(ctx); err != nil {
 		return NewDBError(ErrCodePingFailed, "ping failed", err)
 	}
 
 	return nil
 }
 
-func (d *DB) Stats() sql.DBStats {
-	return d.db.Stats()
+func (s *Service) Stats() sql.DBStats {
+	return s.db.Stats()
 }
 
-func (d *DB) Metrics() map[string]interface{} {
-	metrics := d.metrics.Snapshot()
+func (s *Service) Metrics() map[string]interface{} {
+	metrics := s.metrics.Snapshot()
 	
 	// Add connection pool stats
-	stats := d.db.Stats()
+	stats := s.db.Stats()
 	metrics["pool_open_connections"] = stats.OpenConnections
 	metrics["pool_in_use"] = stats.InUse
 	metrics["pool_idle"] = stats.Idle
@@ -301,19 +305,19 @@ func (d *DB) Metrics() map[string]interface{} {
 	return metrics
 }
 
-func (d *DB) Close() error {
-	if !d.state.CompareAndSwap(stateConnected, stateClosing) {
+func (s *Service) Close() error {
+	if !s.state.CompareAndSwap(stateConnected, stateClosing) {
 		return nil // Already closing or closed
 	}
 
 	log.Println("[DB] Closing connection...")
 
-	if err := d.db.Close(); err != nil {
-		d.state.Store(stateClosed)
+	if err := s.db.Close(); err != nil {
+		s.state.Store(stateClosed)
 		return NewDBError(ErrCodeConnectionFailed, "close failed", err)
 	}
 
-	d.state.Store(stateClosed)
+	s.state.Store(stateClosed)
 	log.Println("[DB] Connection closed")
 	return nil
 }
@@ -322,17 +326,17 @@ func (d *DB) Close() error {
 // QUERY HELPERS
 // ============================================================================
 
-func (d *DB) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+func (s *Service) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
 	start := time.Now()
 	
-	rows, err := d.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	
 	duration := time.Since(start)
-	d.metrics.RecordQuery(duration, err == nil)
+	s.metrics.RecordQuery(duration, err == nil)
 	
 	if err != nil {
 		if ctx.Err() == context.Canceled {
-			d.metrics.RecordContextCanceled()
+			s.metrics.RecordContextCanceled()
 			return nil, NewDBError(ErrCodeContextCanceled, "query canceled", err)
 		}
 		
@@ -348,13 +352,13 @@ func (d *DB) QueryContext(ctx context.Context, query string, args ...interface{}
 	return rows, nil
 }
 
-func (d *DB) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
+func (s *Service) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	start := time.Now()
 	
-	row := d.db.QueryRowContext(ctx, query, args...)
+	row := s.db.QueryRowContext(ctx, query, args...)
 	
 	duration := time.Since(start)
-	d.metrics.RecordQuery(duration, true) // Row errors are deferred
+	s.metrics.RecordQuery(duration, true) // Row errors are deferred
 	
 	if duration > 1*time.Second {
 		log.Printf("[DB] SLOW QUERY (%v): %s", duration, query)
@@ -363,17 +367,17 @@ func (d *DB) QueryRowContext(ctx context.Context, query string, args ...interfac
 	return row
 }
 
-func (d *DB) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+func (s *Service) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
 	start := time.Now()
 	
-	result, err := d.db.ExecContext(ctx, query, args...)
+	result, err := s.db.ExecContext(ctx, query, args...)
 	
 	duration := time.Since(start)
-	d.metrics.RecordQuery(duration, err == nil)
+	s.metrics.RecordQuery(duration, err == nil)
 	
 	if err != nil {
 		if ctx.Err() == context.Canceled {
-			d.metrics.RecordContextCanceled()
+			s.metrics.RecordContextCanceled()
 			return nil, NewDBError(ErrCodeContextCanceled, "exec canceled", err)
 		}
 		
@@ -395,21 +399,21 @@ func (d *DB) ExecContext(ctx context.Context, query string, args ...interface{})
 
 type Tx struct {
 	tx      *sql.Tx
-	db      *DB
+	service *Service
 	ctx     context.Context
 	started time.Time
 }
 
-func (d *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
-	tx, err := d.db.BeginTx(ctx, opts)
+func (s *Service) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
+	tx, err := s.db.BeginTx(ctx, opts)
 	if err != nil {
-		d.metrics.RecordTransaction(false)
+		s.metrics.RecordTransaction(false)
 		return nil, NewDBError(ErrCodeTransactionFailed, "begin transaction failed", err)
 	}
 
 	return &Tx{
 		tx:      tx,
-		db:      d,
+		service: s,
 		ctx:     ctx,
 		started: time.Now(),
 	}, nil
@@ -419,7 +423,7 @@ func (t *Tx) Commit() error {
 	err := t.tx.Commit()
 	duration := time.Since(t.started)
 	
-	t.db.metrics.RecordTransaction(err == nil)
+	t.service.metrics.RecordTransaction(err == nil)
 	
 	if err != nil {
 		return NewDBError(ErrCodeTransactionFailed, "commit failed", err)
@@ -434,7 +438,7 @@ func (t *Tx) Commit() error {
 
 func (t *Tx) Rollback() error {
 	err := t.tx.Rollback()
-	t.db.metrics.RecordTransaction(false)
+	t.service.metrics.RecordTransaction(false)
 	
 	if err != nil && err != sql.ErrTxDone {
 		return NewDBError(ErrCodeTransactionFailed, "rollback failed", err)
@@ -449,7 +453,7 @@ func (t *Tx) ExecContext(ctx context.Context, query string, args ...interface{})
 	result, err := t.tx.ExecContext(ctx, query, args...)
 	
 	duration := time.Since(start)
-	t.db.metrics.RecordQuery(duration, err == nil)
+	t.service.metrics.RecordQuery(duration, err == nil)
 	
 	if err != nil {
 		dbErr := NewDBError(ErrCodeQueryFailed, "tx exec failed", err)
@@ -460,13 +464,30 @@ func (t *Tx) ExecContext(ctx context.Context, query string, args ...interface{})
 	return result, nil
 }
 
+func (t *Tx) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	start := time.Now()
+	
+	rows, err := t.tx.QueryContext(ctx, query, args...)
+	
+	duration := time.Since(start)
+	t.service.metrics.RecordQuery(duration, err == nil)
+	
+	if err != nil {
+		dbErr := NewDBError(ErrCodeQueryFailed, "tx query failed", err)
+		dbErr.Query = query
+		return nil, dbErr
+	}
+	
+	return rows, nil
+}
+
 func (t *Tx) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	start := time.Now()
 	
 	row := t.tx.QueryRowContext(ctx, query, args...)
 	
 	duration := time.Since(start)
-	t.db.metrics.RecordQuery(duration, true)
+	t.service.metrics.RecordQuery(duration, true)
 	
 	return row
 }
@@ -506,16 +527,16 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 // HEALTH CHECK
 // ============================================================================
 
-func (d *DB) HealthCheck(ctx context.Context) error {
-	if err := d.Ping(ctx); err != nil {
+func (s *Service) HealthCheck(ctx context.Context) error {
+	if err := s.Ping(ctx); err != nil {
 		return err
 	}
 
 	// Check pool stats
-	stats := d.db.Stats()
-	if stats.OpenConnections >= d.config.MaxOpenConns {
+	stats := s.db.Stats()
+	if stats.OpenConnections >= s.config.MaxOpenConns {
 		return NewDBError(ErrCodePoolExhausted, 
-			fmt.Sprintf("connection pool exhausted: %d/%d", stats.OpenConnections, d.config.MaxOpenConns), 
+			fmt.Sprintf("connection pool exhausted: %d/%d", stats.OpenConnections, s.config.MaxOpenConns), 
 			nil)
 	}
 

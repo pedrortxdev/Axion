@@ -4,7 +4,6 @@ import (
 	"aexon/internal/db"
 	"aexon/internal/types"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"

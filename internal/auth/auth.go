@@ -1,9 +1,9 @@
 package auth
 
 import (
+	"aexon/internal/db"
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -87,13 +87,13 @@ func ErrRateLimited() *AuthError {
 // ============================================================================
 
 const (
-	defaultTokenDuration  = 24 * time.Hour
-	refreshTokenDuration  = 7 * 24 * time.Hour
-	maxLoginAttempts      = 5
-	rateLimitWindow       = 15 * time.Minute
-	bcryptCost            = 12
-	minPasswordLength     = 8
-	tokenIssuer           = "axion-control-plane"
+	defaultTokenDuration = 24 * time.Hour
+	refreshTokenDuration = 7 * 24 * time.Hour
+	maxLoginAttempts     = 5
+	rateLimitWindow      = 15 * time.Minute
+	bcryptCost           = 12
+	minPasswordLength    = 8
+	tokenIssuer          = "axion-control-plane"
 )
 
 type Config struct {
@@ -144,14 +144,14 @@ func getEnv(key, fallback string) string {
 // ============================================================================
 
 type AuthMetrics struct {
-	loginAttempts      atomic.Uint64
-	loginSuccesses     atomic.Uint64
-	loginFailures      atomic.Uint64
-	tokenValidations   atomic.Uint64
-	tokenRejections    atomic.Uint64
-	rateLimitHits      atomic.Uint64
-	tokensRevoked      atomic.Uint64
-	refreshTokensUsed  atomic.Uint64
+	loginAttempts     atomic.Uint64
+	loginSuccesses    atomic.Uint64
+	loginFailures     atomic.Uint64
+	tokenValidations  atomic.Uint64
+	tokenRejections   atomic.Uint64
+	rateLimitHits     atomic.Uint64
+	tokensRevoked     atomic.Uint64
+	refreshTokensUsed atomic.Uint64
 }
 
 var globalAuthMetrics = &AuthMetrics{}
@@ -237,7 +237,7 @@ func (s *TokenRevocationStore) IsRevoked(tokenID string) bool {
 func (s *TokenRevocationStore) Cleanup() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	now := time.Now()
 	for tokenID, expiry := range s.revoked {
 		if now.After(expiry) {
@@ -359,6 +359,7 @@ func StartRateLimitCleanup(ctx context.Context) {
 
 type AuthService struct {
 	config *Config
+	repo   *db.UserRepository
 }
 
 var globalAuthService *AuthService
@@ -369,9 +370,12 @@ func InitAuthService(cfg *Config) *AuthService {
 		if cfg == nil {
 			cfg = DefaultConfig()
 		}
-		globalAuthService = &AuthService{config: cfg}
+		globalAuthService = &AuthService{
+			config: cfg,
+			repo:   db.NewUserRepository(db.GetService()),
+		}
 		rateLimiter.SetConfig(cfg)
-		
+
 		log.Printf("[Auth] Service initialized (token_duration=%v, rate_limit=%v)",
 			cfg.TokenDuration, cfg.EnableRateLimit)
 	})
@@ -387,7 +391,7 @@ func GetAuthService() *AuthService {
 
 func (s *AuthService) GenerateAccessToken(userID, username, role string, permissions []string) (string, error) {
 	tokenID := generateTokenID()
-	
+
 	claims := AxionClaims{
 		UserID:      userID,
 		Username:    username,
@@ -410,7 +414,7 @@ func (s *AuthService) GenerateAccessToken(userID, username, role string, permiss
 
 func (s *AuthService) GenerateRefreshToken(userID, username string) (string, error) {
 	tokenID := generateTokenID()
-	
+
 	claims := AxionClaims{
 		UserID:    userID,
 		Username:  username,
@@ -435,7 +439,7 @@ func (s *AuthService) ValidateToken(tokenString string) (*AxionClaims, error) {
 
 	token, err := jwt.ParseWithClaims(tokenString, &AxionClaims{}, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, NewAuthError(ErrCodeInvalidSigningMethod, 
+			return nil, NewAuthError(ErrCodeInvalidSigningMethod,
 				fmt.Sprintf("unexpected signing method: %v", token.Header["alg"]), nil)
 		}
 		return s.config.SecretKey, nil
@@ -512,7 +516,7 @@ func CheckPasswordHash(password, hash string) bool {
 
 func ValidatePasswordStrength(password string) error {
 	if len(password) < minPasswordLength {
-		return NewAuthError(ErrCodePasswordTooWeak, 
+		return NewAuthError(ErrCodePasswordTooWeak,
 			fmt.Sprintf("password must be at least %d characters", minPasswordLength), nil)
 	}
 
@@ -554,7 +558,7 @@ func generateTokenID() string {
 
 func AuthMiddleware() gin.HandlerFunc {
 	service := GetAuthService()
-	
+
 	return func(c *gin.Context) {
 		var tokenString string
 
@@ -648,6 +652,41 @@ func RequirePermission(permission string) gin.HandlerFunc {
 }
 
 // ============================================================================
+// DB SEEDING
+// ============================================================================
+
+func (s *AuthService) SeedAdmin(ctx context.Context) error {
+	count, err := s.repo.Count(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check user count: %w", err)
+	}
+
+	if count > 0 {
+		return nil // Already initialized
+	}
+
+	log.Println("[Auth] Seeding default admin user...")
+
+	hash, err := HashPassword("admin")
+	if err != nil {
+		return err
+	}
+
+	admin := &db.User{
+		Email:        "admin@admin",
+		PasswordHash: hash,
+		Role:         "admin",
+	}
+
+	if err := s.repo.Create(ctx, admin); err != nil {
+		return fmt.Errorf("failed to create admin: %w", err)
+	}
+
+	log.Println("[Auth] Default admin created: admin@admin / admin")
+	return nil
+}
+
+// ============================================================================
 // HTTP HANDLERS
 // ============================================================================
 
@@ -660,14 +699,15 @@ func LoginHandler(c *gin.Context) {
 	if !rateLimiter.CheckLimit(clientIP) {
 		globalAuthMetrics.loginFailures.Add(1)
 		c.JSON(429, gin.H{
-			"error": "too many login attempts",
-			"code":  ErrCodeRateLimitExceeded,
+			"error":       "too many login attempts",
+			"code":        ErrCodeRateLimitExceeded,
 			"retry_after": int(rateLimitWindow.Seconds()),
 		})
 		return
 	}
 
 	var req struct {
+		Email    string `json:"email"`
 		Username string `json:"username"`
 		Password string `json:"password" binding:"required"`
 	}
@@ -678,18 +718,33 @@ func LoginHandler(c *gin.Context) {
 		return
 	}
 
-	// Get expected password (in production, check against database with hashed password)
-	expectedPass := os.Getenv("AXION_PASSWORD")
-	if expectedPass == "" {
-		log.Println("[SECURITY WARNING] AXION_PASSWORD not set! Using insecure fallback")
-		expectedPass = "admin123"
+	// Support both email and username fields for now
+	email := req.Email
+	if email == "" {
+		email = req.Username
+	}
+	// If user sends "admin" (not email format), we might want to allow "admin" -> "admin@admin"?
+	// The prompt specified "admin@admin".
+
+	// DB Lookup
+	user, err := service.repo.GetByEmail(c.Request.Context(), email)
+	if err != nil {
+		log.Printf("[Auth] Login DB error: %v", err)
+		c.JSON(500, gin.H{"error": "internal error"})
+		return
 	}
 
-	// Use constant-time comparison
-	if subtle.ConstantTimeCompare([]byte(req.Password), []byte(expectedPass)) != 1 {
+	// Constant time comparison happens inside bcrypt mostly, but here we just check validity
+	valid := false
+	if user != nil {
+		valid = CheckPasswordHash(req.Password, user.PasswordHash)
+	} else {
+		// Fake comparison to mitigate timing attacks
+		CheckPasswordHash("dummy", "$2a$12$EixZaYVK1fsbw1ZfbX3OXePaWrn96pzwPenWzJ41pgard.dnD.U1q")
+	}
+
+	if !valid {
 		globalAuthMetrics.loginFailures.Add(1)
-		// Add delay to prevent timing attacks
-		time.Sleep(time.Duration(100+rand.Int()%200) * time.Millisecond)
 		c.JSON(401, gin.H{
 			"error": "invalid credentials",
 			"code":  ErrCodeInvalidCredentials,
@@ -702,18 +757,16 @@ func LoginHandler(c *gin.Context) {
 	globalAuthMetrics.loginSuccesses.Add(1)
 
 	// Generate tokens
-	username := req.Username
-	if username == "" {
-		username = "admin"
-	}
+	// UserID is now user.ID (int), converts to string
+	uidStr := fmt.Sprintf("%d", user.ID)
 
-	accessToken, err := service.GenerateAccessToken("admin-001", username, "admin", []string{"*"})
+	accessToken, err := service.GenerateAccessToken(uidStr, user.Email, user.Role, []string{"*"})
 	if err != nil {
 		c.JSON(500, gin.H{"error": "failed to generate token"})
 		return
 	}
 
-	refreshToken, err := service.GenerateRefreshToken("admin-001", username)
+	refreshToken, err := service.GenerateRefreshToken(uidStr, user.Email)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "failed to generate refresh token"})
 		return
@@ -724,6 +777,69 @@ func LoginHandler(c *gin.Context) {
 		"refresh_token": refreshToken,
 		"token_type":    "Bearer",
 		"expires_in":    int(service.config.TokenDuration.Seconds()),
+		"user": gin.H{
+			"id":    user.ID,
+			"email": user.Email,
+			"role":  user.Role,
+		},
+	})
+}
+
+func RegisterHandler(c *gin.Context) {
+	service := GetAuthService()
+
+	var req struct {
+		Email    string `json:"email" binding:"required"`
+		Password string `json:"password" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "invalid request"})
+		return
+	}
+
+	// Check if user exists
+	existing, err := service.repo.GetByEmail(c.Request.Context(), req.Email)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "internal error"})
+		return
+	}
+	if existing != nil {
+		c.JSON(409, gin.H{"error": "email already registered"})
+		return
+	}
+
+	// Hash Password
+	if service.config.RequireStrongPass {
+		if err := ValidatePasswordStrength(req.Password); err != nil {
+			c.JSON(400, gin.H{"error": err.Error(), "code": ErrCodePasswordTooWeak})
+			return
+		}
+	}
+
+	hash, err := HashPassword(req.Password)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "failed to process password"})
+		return
+	}
+
+	// Create User
+	newUser := &db.User{
+		Email:        req.Email,
+		PasswordHash: hash,
+		Role:         "user", // Default role
+	}
+
+	if err := service.repo.Create(c.Request.Context(), newUser); err != nil {
+		log.Printf("[Auth] Create user error: %v", err)
+		c.JSON(500, gin.H{"error": "failed to create user"})
+		return
+	}
+
+	c.JSON(201, gin.H{
+		"status": "created",
+		"id":     newUser.ID,
+		"email":  newUser.Email,
 	})
 }
 

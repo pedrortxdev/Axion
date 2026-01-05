@@ -1,5 +1,5 @@
 // database/jobs.go
-package database
+package db
 
 import (
 	"context"
@@ -30,10 +30,10 @@ type Job struct {
 }
 
 type JobRepository struct {
-	db *DB
+	db *Service
 }
 
-func NewJobRepository(db *DB) *JobRepository {
+func NewJobRepository(db *Service) *JobRepository {
 	return &JobRepository{db: db}
 }
 
@@ -783,49 +783,49 @@ func (r *JobRepository) DeleteByStatus(ctx context.Context, status types.JobStat
 
 func CreateJob(job *Job) error {
 	ctx := context.Background()
-	repo := NewJobRepository(GetDB())
+	repo := NewJobRepository(GetService())
 	return repo.Create(ctx, job)
 }
 
 func GetJob(id string) (*Job, error) {
 	ctx := context.Background()
-	repo := NewJobRepository(GetDB())
+	repo := NewJobRepository(GetService())
 	return repo.Get(ctx, id)
 }
 
 func ListRecentJobs(limit int) ([]Job, error) {
 	ctx := context.Background()
-	repo := NewJobRepository(GetDB())
+	repo := NewJobRepository(GetService())
 	return repo.List(ctx, limit)
 }
 
 func MarkJobStarted(id string) error {
 	ctx := context.Background()
-	repo := NewJobRepository(GetDB())
+	repo := NewJobRepository(GetService())
 	return repo.MarkStarted(ctx, id)
 }
 
 func MarkJobCompleted(id string) error {
 	ctx := context.Background()
-	repo := NewJobRepository(GetDB())
+	repo := NewJobRepository(GetService())
 	return repo.MarkCompleted(ctx, id)
 }
 
 func MarkJobFailed(id string, errorMsg string, isFatal bool) error {
 	ctx := context.Background()
-	repo := NewJobRepository(GetDB())
+	repo := NewJobRepository(GetService())
 	return repo.MarkFailed(ctx, id, errorMsg, isFatal)
 }
 
 func RecoverStuckJobs() error {
 	ctx := context.Background()
-	repo := NewJobRepository(GetDB())
+	repo := NewJobRepository(GetService())
 	_, err := repo.RecoverStuckJobs(ctx, 5*time.Minute)
 	return err
 }
 
 func GetLastBackupJob(instanceName string) (*Job, error) {
 	ctx := context.Background()
-	repo := NewJobRepository(GetDB())
+	repo := NewJobRepository(GetService())
 	return repo.GetLastBackupJob(ctx, instanceName)
 }

@@ -1,5 +1,5 @@
 // database/bootstrap.go
-package database
+package db
 
 import (
 	"context"

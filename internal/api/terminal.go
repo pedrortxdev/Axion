@@ -19,9 +19,9 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// ============================================================================
+// ============================================================================ 
 // ERROR TAXONOMY
-// ============================================================================
+// ============================================================================ 
 
 type ErrorCode int
 
@@ -88,9 +88,9 @@ func ErrResizeFailed(err error) *TerminalError {
 	return NewTerminalError(ErrCodeResizeFailed, "terminal resize failed", err)
 }
 
-// ============================================================================
+// ============================================================================ 
 // WEBSOCKET CONFIGURATION
-// ============================================================================
+// ============================================================================ 
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  8192,
@@ -117,9 +117,9 @@ const (
 	msgTypePong   = "pong"
 )
 
-// ============================================================================
+// ============================================================================ 
 // METRICS
-// ============================================================================
+// ============================================================================ 
 
 type TerminalMetrics struct {
 	sessionsTotal     atomic.Uint64
@@ -147,9 +147,9 @@ func (m *TerminalMetrics) Snapshot() map[string]interface{} {
 	}
 }
 
-// ============================================================================
+// ============================================================================ 
 // WEBSOCKET WRITER
-// ============================================================================
+// ============================================================================ 
 
 type wsWriter struct {
 	conn   *websocket.Conn
@@ -185,9 +185,9 @@ func (w *wsWriter) Close() error {
 	return nil
 }
 
-// ============================================================================
+// ============================================================================ 
 // MESSAGE TYPES
-// ============================================================================
+// ============================================================================ 
 
 type ResizeMessage struct {
 	Type string `json:"type"`
@@ -206,9 +206,9 @@ type ControlMessage struct {
 	Payload []byte `json:"payload,omitempty"`
 }
 
-// ============================================================================
+// ============================================================================ 
 // TERMINAL SESSION
-// ============================================================================
+// ============================================================================ 
 
 type TerminalSession struct {
 	instanceName    string
@@ -224,7 +224,7 @@ type TerminalSession struct {
 	
 	state           atomic.Uint32
 	errCh           chan error
-	controlCh       chan *websocket.Conn
+	controlCh      chan *websocket.Conn
 	
 	wg              sync.WaitGroup
 	closeOnce       sync.Once
@@ -517,9 +517,9 @@ func (s *TerminalSession) Close() {
 	})
 }
 
-// ============================================================================
+// ============================================================================ 
 // HTTP HANDLER
-// ============================================================================
+// ============================================================================ 
 
 func TerminalHandler(c *gin.Context, instanceService *lxc.InstanceService) {
 	instanceName := c.Param("name")
@@ -553,13 +553,20 @@ func TerminalHandler(c *gin.Context, instanceService *lxc.InstanceService) {
 		return
 	}
 
-	log.Printf("[Terminal] New session for instance: %s", instanceName)
+	// Generate unique session ID
+	sessionID := fmt.Sprintf("%s-%d", instanceName, time.Now().UnixNano())
+	log.Printf("[Terminal] New session %s for instance: %s", sessionID, instanceName)
 
-	// Create and start session
+	// Create session
 	session := NewTerminalSession(instanceName, conn, instanceService)
 	
+	// CRITICAL: Register session for graceful shutdown tracking
+	RegisterSession(sessionID, session)
+	defer UnregisterSession(sessionID)
+	
+	// Start session
 	if err := session.Start(); err != nil {
-		log.Printf("[Terminal] Session start failed for %s: %v", instanceName, err)
+		log.Printf("[Terminal] Session %s start failed: %v", sessionID, err)
 		session.writeErrorMessage(err.Error())
 		session.Close()
 		return
@@ -567,20 +574,24 @@ func TerminalHandler(c *gin.Context, instanceService *lxc.InstanceService) {
 
 	// Block until session closes
 	<-session.ctx.Done()
-	log.Printf("[Terminal] Session completed for instance: %s", instanceName)
+	log.Printf("[Terminal] Session %s completed for instance: %s", sessionID, instanceName)
 }
 
-// ============================================================================
+// ============================================================================ 
 // METRICS ENDPOINT
-// ============================================================================
+// ============================================================================ 
 
 func GetTerminalMetrics(c *gin.Context) {
-	c.JSON(200, globalMetrics.Snapshot())
+	metrics := globalMetrics.Snapshot()
+	metrics["active_session_count"] = GetActiveSessionCount()
+	metrics["active_session_ids"] = GetActiveSessionIDs()
+	
+	c.JSON(200, metrics)
 }
 
-// ============================================================================
+// ============================================================================ 
 // GRACEFUL SHUTDOWN & SESSION TRACKING
-// ============================================================================
+// ============================================================================ 
 
 var (
 	activeSessions   = make(map[string]*TerminalSession)
@@ -656,7 +667,7 @@ func ShutdownAllSessions(ctx context.Context) error {
 				return fmt.Errorf("shutdown timeout: %d sessions remaining", remaining)
 			}
 			return nil
-			
+		
 		case <-ticker.C:
 			active := globalMetrics.sessionsActive.Load()
 			if active == 0 {
@@ -672,81 +683,59 @@ func ShutdownAllSessions(ctx context.Context) error {
 	}
 }
 
-// ============================================================================
-// HTTP HANDLER
-// ============================================================================
+// ============================================================================ 
+// ADMIN HANDLERS
+// ============================================================================ 
 
-func TerminalHandler(c *gin.Context, instanceService *lxc.InstanceService) {
-	instanceName := c.Param("name")
-	token := c.Query("token")
+func ListActiveSessionsHandler(c *gin.Context) {
+	c.JSON(200, gin.H{
+		"count":    GetActiveSessionCount(),
+		"sessions": GetActiveSessionIDs(),
+	})
+}
 
-	// Validate authentication
-	if token == "" {
-		globalMetrics.authFailures.Add(1)
-		c.JSON(401, gin.H{
-			"error": "authentication required",
-			"code":  ErrCodeTokenMissing,
+func CloseSessionHandler(c *gin.Context) {
+	sessionID := c.Param("id")
+	
+	sessionsMutex.RLock()
+	session, exists := activeSessions[sessionID]
+	sessionsMutex.RUnlock()
+	
+	if !exists {
+		c.JSON(404, gin.H{"error": "session not found"})
+		return
+	}
+	
+	log.Printf("[Admin] Force closing session: %s", sessionID)
+	session.Close()
+	
+	c.JSON(200, gin.H{
+		"status":     "closed",
+		"session_id": sessionID,
+	})
+}
+
+func ShutdownAllSessionsHandler(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	if err := ShutdownAllSessions(ctx); err != nil {
+		c.JSON(500, gin.H{
+			"error":   "shutdown failed",
+			"details": err.Error(),
 		})
 		return
 	}
-
-	if _, err := auth.ValidateToken(token); err != nil {
-		globalMetrics.authFailures.Add(1)
-		log.Printf("[Terminal] Auth failed for instance %s: %v", instanceName, err)
-		c.JSON(401, gin.H{
-			"error": "invalid token",
-			"code":  ErrCodeTokenInvalid,
-		})
-		return
-	}
-
-	// Upgrade to WebSocket
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
-	if err != nil {
-		globalMetrics.upgradeFailures.Add(1)
-		log.Printf("[Terminal] WebSocket upgrade failed for %s: %v", instanceName, err)
-		return
-	}
-
-	// Generate unique session ID
-	sessionID := fmt.Sprintf("%s-%d", instanceName, time.Now().UnixNano())
-	log.Printf("[Terminal] New session %s for instance: %s", sessionID, instanceName)
-
-	// Create session
-	session := NewTerminalSession(instanceName, conn, instanceService)
 	
-	// CRITICAL: Register session for graceful shutdown tracking
-	RegisterSession(sessionID, session)
-	defer UnregisterSession(sessionID)
-	
-	// Start session
-	if err := session.Start(); err != nil {
-		log.Printf("[Terminal] Session %s start failed: %v", sessionID, err)
-		session.writeErrorMessage(err.Error())
-		session.Close()
-		return
-	}
-
-	// Block until session closes
-	<-session.ctx.Done()
-	log.Printf("[Terminal] Session %s completed for instance: %s", sessionID, instanceName)
+	c.JSON(200, gin.H{
+		"status":  "success",
+		"message": "all sessions closed",
+	})
 }
 
-// ============================================================================
-// METRICS ENDPOINT
-// ============================================================================
-
-func GetTerminalMetrics(c *gin.Context) {
-	metrics := globalMetrics.Snapshot()
-	metrics["active_session_count"] = GetActiveSessionCount()
-	metrics["active_session_ids"] = GetActiveSessionIDs()
-	
-	c.JSON(200, metrics)
-}
-
-// ============================================================================
+// ============================================================================ 
 // ROUTER REGISTRATION
-// ============================================================================
+// ============================================================================ 
 
 // RegisterTerminalRoutes registers all terminal-related routes
 // Call this in your main.go during router setup
@@ -768,61 +757,3 @@ func RegisterTerminalRoutes(r *gin.Engine, instanceService *lxc.InstanceService)
 		admin.POST("/shutdown", ShutdownAllSessionsHandler)
 	}
 }
-
-// ============================================================================
-// INTEGRATION WITH MAIN APPLICATION
-// ============================================================================
-
-// Example integration in main.go:
-/*
-func main() {
-	// ... initialize app ...
-	
-	lxcClient, err := lxc.NewClient()
-	if err != nil {
-		log.Fatal(err)
-	}
-	
-	r := gin.Default()
-	
-	// Register terminal routes
-	api.RegisterTerminalRoutes(r, lxcClient)
-	
-	// Start server
-	srv := &http.Server{
-		Addr:    ":8500",
-		Handler: r,
-	}
-	
-	go func() {
-		if err := srv.ListenAndServe(); err != nil {
-			log.Fatal(err)
-		}
-	}()
-	
-	// Graceful shutdown
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	
-	log.Println("Shutting down server...")
-	
-	// Shutdown HTTP server
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("Server shutdown error: %v", err)
-	}
-	
-	// CRITICAL: Shutdown all terminal sessions
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
-	
-	if err := api.ShutdownAllSessions(shutdownCtx); err != nil {
-		log.Printf("Terminal shutdown error: %v", err)
-	}
-	
-	log.Println("Server stopped")
-}
-*/

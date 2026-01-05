@@ -5,6 +5,9 @@ main
 dev
 *.exe
 
+aexon
+axion_server
+
 # Database
 *.db
 *.db-shm

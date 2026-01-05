@@ -33,7 +33,7 @@ const formatMemToMB = (bytes: number) => {
 };
 
 const parseMemoryString = (memStr?: string): number => {
-  if (!memStr) return 128; 
+  if (!memStr) return 128;
   const match = memStr.match(/^(\d+)(MB|GB)?$/i);
   if (!match) return 128;
   const value = parseInt(match[1], 10);
@@ -67,14 +67,14 @@ export default function Dashboard() {
 
   // Refs
   const draggingRef = useRef<Record<string, boolean>>({});
-  
+
   const router = useRouter();
 
 
   // --- Auth Check ---
   useEffect(() => {
     if (!token) {
-        router.push('/login');
+      router.push('/login');
     }
   }, [router, token]);
 
@@ -84,18 +84,18 @@ export default function Dashboard() {
       const protocol = window.location.protocol;
       const host = window.location.hostname;
       const port = '8500';
-      const response = await fetch(`${protocol}//${host}:${port}/instances/${name}/state`, {
+      const response = await fetch(`${protocol}//${host}:${port}/api/v1/instances/${name}/state`, {
         method: 'POST',
-        headers: { 
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}`
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify({ action }),
       });
 
       if (response.status === 401) {
-          router.push('/login');
-          return;
+        router.push('/login');
+        return;
       }
 
       if (response.ok) {
@@ -105,7 +105,7 @@ export default function Dashboard() {
         toast.error("Request Rejected", { description: error.error });
       }
     } catch (error) {
-        toast.error("Network Error");
+      toast.error("Network Error");
     }
   };
 
@@ -118,19 +118,19 @@ export default function Dashboard() {
       const host = window.location.hostname;
       const port = '8500';
       const payload = { memory: `${inputs.memoryInput}MB`, cpu: `${inputs.cpuInput}` };
-      
-      const response = await fetch(`${protocol}//${host}:${port}/instances/${name}/limits`, {
+
+      const response = await fetch(`${protocol}//${host}:${port}/api/v1/instances/${name}/limits`, {
         method: 'POST',
-        headers: { 
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}`
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify(payload),
       });
 
       if (response.status === 401) {
-          router.push('/login');
-          return;
+        router.push('/login');
+        return;
       }
 
       if (response.ok) {
@@ -142,7 +142,7 @@ export default function Dashboard() {
         toast.error("Update Rejected", { description: error.error });
       }
     } catch (error) {
-        toast.error("Network Error");
+      toast.error("Network Error");
     }
   };
 
@@ -154,7 +154,7 @@ export default function Dashboard() {
       const protocol = window.location.protocol;
       const host = window.location.hostname;
       const port = '8500';
-      const response = await fetch(`${protocol}//${host}:${port}/instances/${name}`, {
+      const response = await fetch(`${protocol}//${host}:${port}/api/v1/instances/${name}`, {
         method: 'DELETE',
         headers: { 'Authorization': `Bearer ${token}` }
       });
@@ -166,14 +166,14 @@ export default function Dashboard() {
         toast.error("Deletion Rejected");
       }
     } catch (error) {
-        toast.error("Network Error");
+      toast.error("Network Error");
     }
   };
 
   const handleSliderChange = (name: string, type: 'memory' | 'cpu', value: number) => {
     setResourceInputs(prev => ({
-        ...prev,
-        [name]: { ...prev[name], [type === 'memory' ? 'memoryInput' : 'cpuInput']: value, isDirty: true }
+      ...prev,
+      [name]: { ...prev[name], [type === 'memory' ? 'memoryInput' : 'cpuInput']: value, isDirty: true }
     }));
   };
 
@@ -184,9 +184,9 @@ export default function Dashboard() {
   // Close menu when clicking outside
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
-        if (menuOpen && !(event.target as Element).closest('.menu-trigger')) {
-            setMenuOpen(null);
-        }
+      if (menuOpen && !(event.target as Element).closest('.menu-trigger')) {
+        setMenuOpen(null);
+      }
     };
     document.addEventListener('click', handleClickOutside);
     return () => document.removeEventListener('click', handleClickOutside);
@@ -194,7 +194,7 @@ export default function Dashboard() {
 
   // --- Render ---
 
-  if (!token) return null; 
+  if (!token) return null;
 
   const getCpuUsagePercent = (inst: InstanceMetric, prevMetrics: Record<string, InstanceMetric>, lastTelemetryTime: string) => {
     const prevInst = prevMetrics[inst.name];

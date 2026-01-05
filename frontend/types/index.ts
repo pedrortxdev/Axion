@@ -53,49 +53,49 @@ export interface InstanceBackupInfo {
 }
 
 export interface InstanceState {
-    status: string;
-    status_code: number;
-    disk: {
-        [deviceName: string]: {
-            usage: number;
-        };
+  status: string;
+  status_code: number;
+  disk: {
+    [deviceName: string]: {
+      usage: number;
     };
-    memory: {
-        usage: number;
-        usage_peak: number;
-        swap_usage: number;
-        swap_usage_peak: number;
-        total: number;
+  };
+  memory: {
+    usage: number;
+    usage_peak: number;
+    swap_usage: number;
+    swap_usage_peak: number;
+    total: number;
+  };
+  root_device?: {
+    usage: number;
+    total: number;
+  };
+  network: {
+    [interfaceName: string]: {
+      addresses: {
+        family: string;
+        address: string;
+        netmask: string;
+        scope: string;
+      }[];
+      counters: {
+        bytes_received: number;
+        bytes_sent: number;
+        packets_received: number;
+        packets_sent: number;
+      };
+      hwaddr: string;
+      mtu: number;
+      state: string;
+      type: string;
     };
-    root_device?: {
-        usage: number;
-        total: number;
-    };
-    network: {
-        [interfaceName: string]: {
-            addresses: {
-                family: string;
-                address: string;
-                netmask: string;
-                scope: string;
-            }[];
-            counters: {
-                bytes_received: number;
-                bytes_sent: number;
-                packets_received: number;
-                packets_sent: number;
-            };
-            hwaddr: string;
-            mtu: number;
-            state: string;
-            type: string;
-        };
-    };
-    pid: number;
-    processes: number;
-    cpu: {
-        usage: number;
-    };
+  };
+  pid: number;
+  processes: number;
+  cpu: {
+    usage: number;
+  };
 }
 
 export interface InstanceMetric {
@@ -110,7 +110,7 @@ export interface InstanceMetric {
   network_tx_bytes: number;
   config: InstanceConfig;
   devices?: InstanceDevices;
-  state?: InstanceState; 
+  state?: InstanceState;
   backup_info?: InstanceBackupInfo; // Added for backup observability
 }
 
@@ -150,3 +150,29 @@ export interface MetricHistory {
   memory_usage: number;
 }
 
+
+export interface InstanceMetrics {
+  cpuUsageUs: number;      // Microsegundos de CPU
+  memoryUsedBytes: number; // RAM usada
+  netRxBytes: number;      // Download acumulado
+  netTxBytes: number;      // Upload acumulado
+  diskAllocatedBytes: number; // Espaço físico ocupado
+}
+
+export interface Instance {
+  id: string; // Equal to name for now in Axion
+  name: string;
+  status: "RUNNING" | "STOPPED" | "PAUSED" | "UNKNOWN";
+  ipAddress: string; // 172.16...
+
+  // Mapeamento de portas
+  portMap?: Record<string, number>;
+
+  plan?: "free" | "pro"; // Derived or API provided
+
+  // Legacy/Compatible fields
+  image?: string;
+  limits?: Record<string, string>;
+  type?: string;
+  created_at?: string;
+}

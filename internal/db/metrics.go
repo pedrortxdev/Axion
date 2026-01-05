@@ -1,9 +1,9 @@
 // database/metrics.go
-package database
+package db
 
 import (
 	"context"
-	"fmt"
+	"database/sql"
 	"log"
 	"time"
 )
@@ -37,10 +37,10 @@ type AggregatedMetric struct {
 // ============================================================================
 
 type MetricsRepository struct {
-	db *DB
+	db *Service
 }
 
-func NewMetricsRepository(db *DB) *MetricsRepository {
+func NewMetricsRepository(db *Service) *MetricsRepository {
 	return &MetricsRepository{db: db}
 }
 
@@ -560,12 +560,12 @@ func (r *MetricsRepository) DownsampleOldMetrics(ctx context.Context, olderThan 
 
 func InsertMetric(m *Metric) error {
 	ctx := context.Background()
-	repo := NewMetricsRepository(GetDB())
+	repo := NewMetricsRepository(GetService())
 	return repo.Insert(ctx, m)
 }
 
 func GetInstanceMetrics(instanceName string, interval string) ([]Metric, error) {
 	ctx := context.Background()
-	repo := NewMetricsRepository(GetDB())
+	repo := NewMetricsRepository(GetService())
 	return repo.GetByInstance(ctx, instanceName, interval)
 }

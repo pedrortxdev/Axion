@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package axhv;
+
+option go_package = "aexon/internal/provider/axhv/pb";
+
+service VmService {
+  // Lifecycle Management
+  rpc CreateVm(CreateVmRequest) returns (VmResponse);
+  rpc StartVm(VmIdRequest) returns (VmResponse);
+  rpc StopVm(VmIdRequest) returns (VmResponse);
+  rpc PauseVm(VmIdRequest) returns (VmResponse);
+  rpc ResumeVm(VmIdRequest) returns (VmResponse);
+  rpc RebootVm(VmIdRequest) returns (VmResponse);
+  rpc DeleteVm(VmIdRequest) returns (VmResponse);
+  
+  // Resource Management
+  rpc ResizeDisk(ResizeDiskRequest) returns (VmResponse);
+  
+  // Information & Stats
+  rpc ListVms(Empty) returns (ListVmsResponse);
+  rpc GetVmStats(VmIdRequest) returns (VmStatsResponse);
+  rpc GetHostStats(Empty) returns (HostStatsResponse);
+}
+
+// Common Types
+message Empty {}
+
+message VmIdRequest {
+  string id = 1;
+}
+
+message VmResponse {
+  bool success = 1;
+  string message = 2;
+  string vm_id = 3;
+}
+
+// VM Creation
+message CreateVmRequest {
+  string id = 1;
+  uint32 vcpu = 2;
+  uint32 memory_mib = 3;
+  string kernel_path = 4;
+  
+  // Use either rootfs_path OR template
+  string rootfs_path = 5;
+  string template = 6;
+  
+  uint32 disk_size_gb = 7;
+  string guest_ip = 8;
+  string guest_gateway = 9;
+  string boot_args = 10;
+  
+  // Network Limits & Forwarding
+  uint32 bandwidth_limit_mbps = 11;
+  map<string, uint32> port_map_tcp = 12; // "external_port": internal_port
+  map<string, uint32> port_map_udp = 13;
+}
+
+// Disk Resize
+message ResizeDiskRequest {
+  string id = 1;
+  uint32 new_size_gb = 2;
+}
+
+// Listing
+message ListVmsResponse {
+  repeated VmInfo vms = 1;
+}
+
+message VmInfo {
+  string id = 1;
+  uint32 pid = 2;
+  string socket_path = 3;
+}
+
+// Stats
+message VmStatsResponse {
+  string cpu_usage_us = 1;      // Microseconds
+  string memory_used_bytes = 2;
+  string net_rx_bytes = 3;      // Upload (from VM perspective)
+  string net_tx_bytes = 4;      // Download (from VM perspective)
+  string disk_allocated_bytes = 5;
+}
+
+message HostStatsResponse {
+  uint64 disk_total_mib = 1;
+  uint64 disk_used_mib = 2;
+  uint64 disk_free_mib = 3;
+  uint32 vm_count = 4;
+}

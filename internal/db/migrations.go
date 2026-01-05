@@ -1,12 +1,10 @@
 // database/migrations.go
-package database
+package db
 
 import (
 	"context"
 	"fmt"
 	"log"
-	"os/exec"
-	"strings"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -119,13 +117,113 @@ var migrations = []Migration{
 		`,
 		Down: `DROP TABLE IF EXISTS branding_settings CASCADE;`,
 	},
+	{
+		Version:     6,
+		Description: "Create and populate IPAM leases table",
+		Up: `
+			CREATE TABLE IF NOT EXISTS ip_leases (
+				ip VARCHAR(15) PRIMARY KEY,
+				instance_name TEXT,
+				allocated_at TIMESTAMP,
+				CONSTRAINT fk_instance FOREIGN KEY (instance_name) REFERENCES instances(name) ON DELETE SET NULL
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_ip_leases_instance ON ip_leases(instance_name);
+
+			-- Populate with 172.16.0.2 to 172.16.0.254
+			DO $$
+			BEGIN
+				FOR i IN 2..254 LOOP
+					INSERT INTO ip_leases (ip) VALUES ('172.16.0.' || i) ON CONFLICT DO NOTHING;
+				END LOOP;
+			END $$;
+		`,
+		Down: `DROP TABLE IF EXISTS ip_leases CASCADE;`,
+	},
+	{
+		Version:     7,
+		Description: "Create users table",
+		Up: `
+			CREATE TABLE IF NOT EXISTS users (
+				id SERIAL PRIMARY KEY,
+				email TEXT UNIQUE NOT NULL,
+				password_hash TEXT NOT NULL,
+				role TEXT DEFAULT 'user',
+				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+			);
+			CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+		`,
+		Down: `DROP TABLE IF EXISTS users CASCADE;`,
+	},
+	{
+		Version:     8,
+		Description: "Create networks table and link to ip_leases",
+		Up: `
+			CREATE TABLE IF NOT EXISTS networks (
+				id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+				name VARCHAR(50) NOT NULL,
+				cidr VARCHAR(18) NOT NULL,
+				gateway VARCHAR(15) NOT NULL,
+				dns1 VARCHAR(15) DEFAULT '1.1.1.1',
+				vlan_id INT DEFAULT 0,
+				is_public BOOLEAN DEFAULT FALSE,
+				created_at TIMESTAMP DEFAULT NOW()
+			);
+
+			-- Enable UUID extension if not exists
+			CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+			-- Seed default network
+			INSERT INTO networks (name, cidr, gateway, is_public) 
+			VALUES ('Default Private', '172.16.0.0/24', '172.16.0.1', false);
+
+			-- Add network_id to ip_leases
+			ALTER TABLE ip_leases ADD COLUMN IF NOT EXISTS network_id UUID REFERENCES networks(id);
+
+			-- Link existing IPs to the default network
+			DO $$
+			DECLARE
+				net_id UUID;
+			BEGIN
+				SELECT id INTO net_id FROM networks WHERE cidr = '172.16.0.0/24' LIMIT 1;
+				IF net_id IS NOT NULL THEN
+					UPDATE ip_leases SET network_id = net_id WHERE network_id IS NULL;
+				END IF;
+			END $$;
+		`,
+		Down: `
+			ALTER TABLE ip_leases DROP COLUMN IF EXISTS network_id;
+			DROP TABLE IF EXISTS networks CASCADE;
+		`,
+	},
+	{
+		Version:     9,
+		Description: "Seed extra network pools",
+		Up: `
+			-- 1. Pool Padrão (O que o AxHV usa nativamente)
+			INSERT INTO networks (name, cidr, gateway, dns1, is_public, vlan_id)
+			VALUES ('Default AxHV NAT', '172.16.0.0/24', '172.16.0.1', '1.1.1.1', false, 0);
+
+			-- 2. Pool Extra (Corporativo - 10.x)
+			INSERT INTO networks (name, cidr, gateway, dns1, is_public, vlan_id)
+			VALUES ('Corporate Pool A', '10.0.0.0/24', '10.0.0.1', '8.8.8.8', false, 0);
+
+			-- 3. Pool Home Lab (192.x)
+			INSERT INTO networks (name, cidr, gateway, dns1, is_public, vlan_id)
+			VALUES ('Home Pool B', '192.168.100.0/24', '192.168.100.1', '8.8.4.4', false, 0);
+		`,
+		Down: `
+			DELETE FROM networks WHERE cidr IN ('172.16.0.0/24', '10.0.0.0/24', '192.168.100.0/24');
+		`,
+	},
 }
 
 // ============================================================================
 // MIGRATION MANAGEMENT
 // ============================================================================
 
-func RunMigrations(ctx context.Context, db *DB) error {
+func RunMigrations(ctx context.Context, db *Service) error {
 	log.Println("[Migrations] Starting database migrations...")
 
 	// Ensure schema_migrations table exists
@@ -166,7 +264,7 @@ func RunMigrations(ctx context.Context, db *DB) error {
 	return nil
 }
 
-func ensureSchemaMigrationsTable(ctx context.Context, db *DB) error {
+func ensureSchemaMigrationsTable(ctx context.Context, db *Service) error {
 	query := `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version INTEGER PRIMARY KEY,
@@ -178,7 +276,7 @@ func ensureSchemaMigrationsTable(ctx context.Context, db *DB) error {
 	return err
 }
 
-func getCurrentVersion(ctx context.Context, db *DB) (int, error) {
+func getCurrentVersion(ctx context.Context, db *Service) (int, error) {
 	query := `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`
 
 	var version int
@@ -190,7 +288,7 @@ func getCurrentVersion(ctx context.Context, db *DB) (int, error) {
 	return version, nil
 }
 
-func applyMigration(ctx context.Context, db *DB, migration Migration) error {
+func applyMigration(ctx context.Context, db *Service, migration Migration) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -211,7 +309,7 @@ func applyMigration(ctx context.Context, db *DB, migration Migration) error {
 	return tx.Commit()
 }
 
-func RollbackMigration(ctx context.Context, db *DB, targetVersion int) error {
+func RollbackMigration(ctx context.Context, db *Service, targetVersion int) error {
 	currentVersion, err := getCurrentVersion(ctx, db)
 	if err != nil {
 		return err
@@ -261,61 +359,6 @@ func RollbackMigration(ctx context.Context, db *DB, targetVersion int) error {
 }
 
 // ============================================================================
-// DATABASE BOOTSTRAP
-// ============================================================================
-
-func EnsureDBSetup() {
-	log.Println("[Bootstrap] Attempting to create database and user...")
-
-	// Check if psql is available
-	if _, err := exec.LookPath("psql"); err != nil {
-		log.Printf("[Bootstrap] WARNING: psql not found in PATH. Please create database manually.")
-		return
-	}
-
-	// Try to create user and database using psql
-	commands := []struct {
-		desc string
-		cmd  string
-	}{
-		{
-			desc: "Create user",
-			cmd:  `psql -U postgres -c "CREATE USER axion WITH PASSWORD 'axion_password';"`,
-		},
-		{
-			desc: "Create database",
-			cmd:  `psql -U postgres -c "CREATE DATABASE axion_db OWNER axion;"`,
-		},
-		{
-			desc: "Grant privileges",
-			cmd:  `psql -U postgres -c "GRANT ALL PRIVILEGES ON DATABASE axion_db TO axion;"`,
-		},
-	}
-
-	for _, command := range commands {
-		log.Printf("[Bootstrap] %s...", command.desc)
-
-		cmd := exec.Command("sh", "-c", command.cmd)
-		output, err := cmd.CombinedOutput()
-
-		if err != nil {
-			// Check if error is because resource already exists
-			if strings.Contains(string(output), "already exists") {
-				log.Printf("[Bootstrap] %s already exists (OK)", command.desc)
-				continue
-			}
-
-			log.Printf("[Bootstrap] WARNING: %s failed: %v", command.desc, err)
-			log.Printf("[Bootstrap] Output: %s", string(output))
-		} else {
-			log.Printf("[Bootstrap] %s completed successfully", command.desc)
-		}
-	}
-
-	log.Println("[Bootstrap] Database setup complete (or skipped if already exists)")
-}
-
-// ============================================================================
 // CRON HELPERS
 // ============================================================================
 
@@ -347,7 +390,7 @@ func GetNextRunTime(schedule string) (*time.Time, error) {
 // MAINTENANCE TASKS
 // ============================================================================
 
-func RunMaintenance(ctx context.Context, db *DB) error {
+func RunMaintenance(ctx context.Context, db *Service) error {
 	log.Println("[Maintenance] Starting database maintenance...")
 
 	// Clean old metrics (older than 30 days)
@@ -387,7 +430,7 @@ func RunMaintenance(ctx context.Context, db *DB) error {
 	return nil
 }
 
-func StartMaintenanceScheduler(ctx context.Context, db *DB, interval time.Duration) {
+func StartMaintenanceScheduler(ctx context.Context, db *Service, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -411,7 +454,7 @@ func StartMaintenanceScheduler(ctx context.Context, db *DB, interval time.Durati
 // UTILITY FUNCTIONS
 // ============================================================================
 
-func GetDatabaseSize(ctx context.Context, db *DB, dbName string) (int64, error) {
+func GetDatabaseSize(ctx context.Context, db *Service, dbName string) (int64, error) {
 	query := `SELECT pg_database_size($1)`
 
 	var size int64
@@ -419,7 +462,7 @@ func GetDatabaseSize(ctx context.Context, db *DB, dbName string) (int64, error) 
 	return size, err
 }
 
-func GetTableSizes(ctx context.Context, db *DB) (map[string]int64, error) {
+func GetTableSizes(ctx context.Context, db *Service) (map[string]int64, error) {
 	query := `
 		SELECT
 			tablename,
@@ -451,7 +494,7 @@ func GetTableSizes(ctx context.Context, db *DB) (map[string]int64, error) {
 	return sizes, rows.Err()
 }
 
-func GetConnectionCount(ctx context.Context, db *DB) (int, error) {
+func GetConnectionCount(ctx context.Context, db *Service) (int, error) {
 	query := `
 		SELECT COUNT(*)
 		FROM pg_stat_activity
@@ -461,52 +504,4 @@ func GetConnectionCount(ctx context.Context, db *DB) (int, error) {
 	var count int
 	err := db.QueryRowContext(ctx, query).Scan(&count)
 	return count, err
-}
-
-// ============================================================================
-// INITIALIZATION
-// ============================================================================
-
-func InitializeDatabase(dbPath string) error {
-	// dbPath is ignored - kept for compatibility
-	log.Println("[DB] Initializing database...")
-
-	// Initialize connection
-	cfg := DefaultConfig()
-	db, err := Init(cfg)
-	if err != nil {
-		// Try bootstrap if connection failed
-		if strings.Contains(err.Error(), "authentication failed") ||
-			strings.Contains(err.Error(), "does not exist") {
-			log.Println("[DB] Connection failed, attempting bootstrap...")
-			EnsureDBSetup()
-
-			// Retry connection
-			db, err = Init(cfg)
-			if err != nil {
-				return fmt.Errorf("connection failed after bootstrap: %w", err)
-			}
-		} else {
-			return err
-		}
-	}
-
-	// Run migrations
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := RunMigrations(ctx, db); err != nil {
-		return fmt.Errorf("migrations failed: %w", err)
-	}
-
-	log.Println("[DB] Database initialization complete")
-	return nil
-}
-
-// ============================================================================
-// COMPATIBILITY WRAPPER
-// ============================================================================
-
-func Init(dbPath string) error {
-	return InitializeDatabase(dbPath)
 }

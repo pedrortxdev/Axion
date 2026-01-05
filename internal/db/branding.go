@@ -2,9 +2,9 @@ package db
 
 import (
 	"aexon/internal/types"
+	"context"
 	"database/sql"
 	"errors"
-	"time"
 )
 
 func GetBrandingSettings(userID int) (*types.BrandingSettings, error) {
@@ -14,7 +14,7 @@ func GetBrandingSettings(userID int) (*types.BrandingSettings, error) {
 		WHERE user_id = $1
 	`
 	var s types.BrandingSettings
-	err := DB.QueryRow(query, userID).Scan(
+	err := GetService().QueryRowContext(context.Background(), query, userID).Scan(
 		&s.ID, &s.UserID, &s.LogoURL, &s.PrimaryColor, &s.HidePoweredBy, &s.CreatedAt, &s.UpdatedAt,
 	)
 
@@ -41,7 +41,7 @@ func UpsertBrandingSettings(settings *types.BrandingSettings) error {
 			hide_powered_by = EXCLUDED.hide_powered_by,
 			updated_at = NOW()
 	`
-	_, err := DB.Exec(query, settings.UserID, settings.LogoURL, settings.PrimaryColor, settings.HidePoweredBy)
+	_, err := GetService().ExecContext(context.Background(), query, settings.UserID, settings.LogoURL, settings.PrimaryColor, settings.HidePoweredBy)
 
 	return err
 }

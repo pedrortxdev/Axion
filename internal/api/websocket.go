@@ -72,13 +72,13 @@ var telemetryUpgrader = websocket.Upgrader{
 }
 
 const (
-	metricsInterval     = 1 * time.Second
-	writeTimeout        = 5 * time.Second
-	pingInterval        = 30 * time.Second
-	pongTimeout         = 60 * time.Second
-	channelBufferSize   = 256
-	maxReconnectAttempts = 3
-	shutdownTimeout     = 10 * time.Second
+	telemetryMetricsInterval     = 1 * time.Second
+	telemetryWriteTimeout        = 5 * time.Second
+	telemetryPingInterval        = 30 * time.Second
+	telemetryPongTimeout         = 60 * time.Second
+	telemetryChannelBufferSize   = 256
+	telemetryMaxReconnectAttempts = 3
+	telemetryShutdownTimeout     = 10 * time.Second
 )
 
 // ============================================================================
@@ -185,7 +185,7 @@ func NewTelemetryClient(
 	client := &TelemetryClient{
 		id:              id,
 		conn:            conn,
-		sendChan:        make(chan *TelemetryMessage, channelBufferSize),
+		sendChan:        make(chan *TelemetryMessage, telemetryChannelBufferSize),
 		instanceService: instanceService,
 		metricProcessor: metricProcessor,
 		ctx:             ctx,
@@ -230,7 +230,7 @@ func (c *TelemetryClient) metricsPoller() {
 	defer c.wg.Done()
 	defer log.Printf("[Telemetry] Client %s metrics poller stopped", c.id)
 
-	ticker := time.NewTicker(metricsInterval)
+	ticker := time.NewTicker(telemetryMetricsInterval)
 	defer ticker.Stop()
 
 	for {
@@ -314,7 +314,7 @@ func (c *TelemetryClient) writeLoop() {
 				return
 			}
 
-			c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			c.conn.SetWriteDeadline(time.Now().Add(telemetryWriteTimeout))
 			if err := c.conn.WriteJSON(msg); err != nil {
 				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					log.Printf("[Telemetry] Client %s write error: %v", c.id, err)
@@ -334,7 +334,7 @@ func (c *TelemetryClient) writeLoop() {
 func (c *TelemetryClient) pingLoop() {
 	defer c.wg.Done()
 
-	pingTicker := time.NewTicker(pingInterval)
+	pingTicker := time.NewTicker(telemetryPingInterval)
 	defer pingTicker.Stop()
 
 	checkTicker := time.NewTicker(5 * time.Second)
@@ -343,7 +343,7 @@ func (c *TelemetryClient) pingLoop() {
 	for {
 		select {
 		case <-pingTicker.C:
-			c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			c.conn.SetWriteDeadline(time.Now().Add(telemetryWriteTimeout))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				log.Printf("[Telemetry] Client %s ping failed: %v", c.id, err)
 				c.Close()
@@ -352,7 +352,7 @@ func (c *TelemetryClient) pingLoop() {
 
 		case <-checkTicker.C:
 			lastPong := time.Unix(0, c.lastPong.Load())
-			if time.Since(lastPong) > pongTimeout {
+			if time.Since(lastPong) > telemetryPongTimeout {
 				log.Printf("[Telemetry] Client %s pong timeout (no response for %v)", c.id, time.Since(lastPong))
 				c.Close()
 				return
@@ -408,7 +408,7 @@ func (c *TelemetryClient) Close() {
 		select {
 		case <-done:
 			log.Printf("[Telemetry] Client %s clean shutdown", c.id)
-		case <-time.After(shutdownTimeout):
+		case <-time.After(telemetryShutdownTimeout):
 			log.Printf("[Telemetry] Client %s shutdown timeout", c.id)
 		}
 

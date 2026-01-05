@@ -41,11 +41,6 @@ const Sidebar = () => {
       icon: Box
     },
     {
-      href: '/images',
-      label: 'Images',
-      icon: FileUp
-    },
-    {
       href: '/networks',
       label: 'Networks',
       icon: Network
@@ -110,8 +105,8 @@ const Sidebar = () => {
                 <Link
                   href={item.href}
                   className={`flex items-center gap-3 px-4 py-3 rounded-lg text-sm transition-colors ${isActive
-                      ? 'bg-zinc-800/50 text-white'
-                      : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/30'
+                    ? 'bg-zinc-800/50 text-white'
+                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/30'
                     }`}
                 >
                   <Icon size={18} />
